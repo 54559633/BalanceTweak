@@ -745,21 +745,15 @@ static void BTInit(void) {
     BTLOG(@"安全模式: %@", safeMode ? @"开" : @"关");
     BTLOG(@"三指长按 1 秒 → 打开设置");
 
-    // ★ 方案 1：TTNet 精准 Hook（立即安装，拦截 TTNetworkManagerChromium / TTHttpTaskChromium）
-    BTSetTTNetPatchFunc(btProtocolPatch);
-    if (!safeMode) {
-        BTInstallTTNetProbe();
-    } else {
-        BTLOG(@"安全模式：跳过 TTNetHook（可在设置界面点「重置」恢复）");
-    }
+    // ★ 方案 2（主力）：钱包 Model/Manager 层纯 ObjC Hook
+    //   已实测覆盖 IESLiveWalletModel / IESLiveWalletMyCoinModel / IESLiveWalletManager / IESLiveWalletSwiftManager
+    //   待所有动态库/Swift模块加载完毕后（1.5s）安装
+    BTSetWalletCallbacks(btWalletRecordReal, btWalletGetDisplay);
 
-    // ★ 方案 A/B（兜底）：NSURLProtocol + NSURLSession completion hook
+    // ★ 兜底：NSURLProtocol + NSURLSession completion hook
     BTInstallURLProtocol();
     BTSetPatchFunc(btProtocolPatch);
     [BTNet install];
-
-    // ★ 方案 2（钱包 Model/Manager 层）：注册回调，待所有动态库/Swift模块加载完毕后（1.5s）安装
-    BTSetWalletCallbacks(btWalletRecordReal, btWalletGetDisplay);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{

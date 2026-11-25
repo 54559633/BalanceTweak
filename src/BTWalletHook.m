@@ -62,8 +62,8 @@ static void btWalletRecordSafe(const char *tag, const char *clsName, const char 
 
 static BOOL btWalletComputeGetterValue(const char *clsName, const char *selName,
                                        int64_t origVal, int64_t *outVal) {
-    // 即使 setter 未触发或发生在 hook 之前，从 ivar 读出的真实值也能立即同步 lastReal
-    if (origVal >= 0) {
+    // 仅当 getter 读到 > 0 的值时才同步 lastReal（避免未初始化对象默认返回 0 误锁基准；真实归零由 setter 记录）
+    if (origVal > 0) {
         btWalletRecordSafe("GET-SYNC", clsName, selName, origVal);
     }
 
