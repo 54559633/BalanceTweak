@@ -25,6 +25,9 @@ id _Nullable BTPatchWalletJSONObject(id _Nullable obj,
 /// 安装精准拦截（TTNetworkManagerChromium PreProcessing + BDXBridgeTtcjpayMultiNetRequestMethod）
 void BTInstallTTNetProbe(void);
 
+/// 运行期启用/停用（用于安全模式实时切换，无需重启）
+void BTSetTTNetActive(BOOL active);
+
 void BTStopTTNetProbe(void);
 
 #endif /* BTTTNetProbe_h */

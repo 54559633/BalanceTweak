@@ -13,7 +13,7 @@
 #import <Foundation/Foundation.h>
 
 /// 记录真实余额的回调（由 BalanceTweak.m 注入，对接 BTPrefs）
-typedef void (*BTWalletRecordRealFunc)(int64_t realVal);
+typedef void (*BTWalletRecordRealFunc)(int64_t realVal, NSString * _Nullable source);
 
 /// 查询当前是否开启改写以及应显示的余额值
 typedef BOOL (*BTWalletGetDisplayFunc)(int64_t * _Nonnull outDisplay, int64_t * _Nonnull outLastReal);
@@ -21,6 +21,9 @@ typedef BOOL (*BTWalletGetDisplayFunc)(int64_t * _Nonnull outDisplay, int64_t * 
 /// 注册回调
 void BTSetWalletCallbacks(BTWalletRecordRealFunc _Nullable recordFunc,
                           BTWalletGetDisplayFunc _Nullable getDisplayFunc);
+
+/// 运行期启用/停用钱包 Hook（用于安全模式实时切换，无需重启）
+void BTSetWalletHookActive(BOOL active);
 
 /// 安装钱包 Model / Manager 层 Hook（纯 ObjC Runtime，非越狱零崩溃）
 void BTInstallWalletModelHook(void);

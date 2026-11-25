@@ -38,15 +38,30 @@
 static NSString *const BTBalanceDidUpdateNotification = @"BTBalanceDidUpdateNotification";
 
 // ============================================================
-// 配置管理（线程安全 + 区分「未设置」与「0」）
+// 配置与内置状态同步中心（线程安全 + 区分「未设置」与「0」）
 // ============================================================
 static NSString *const kKeyEnabled     = @"BT_enabled";
+static NSString *const kKeySafeMode    = @"BT_safemode_v5";
 static NSString *const kKeyBaseDisplay = @"BT_baseDisplay";
 static NSString *const kKeyBaseReal    = @"BT_baseReal";
 static NSString *const kKeyLastReal    = @"BT_lastReal";
 
+static void btSyncRuntimeHooksWithSafeMode(BOOL safeMode) {
+    if (safeMode) {
+        BTSetWalletHookActive(NO);
+        BTSetTTNetActive(NO);
+    } else {
+        // 若启动时因安全模式跳过了安装，此处即时补装，无需重启 App
+        BTInstallWalletModelHook();
+        BTInstallTTNetProbe();
+        BTSetWalletHookActive(YES);
+        BTSetTTNetActive(YES);
+    }
+}
+
 @interface BTPrefsSnapshot : NSObject
 @property (nonatomic, assign) BOOL enabled;
+@property (nonatomic, assign) BOOL safeMode;
 @property (nonatomic, assign) BOOL hasBaseDisplay;
 @property (nonatomic, assign) int64_t baseDisplay;
 @property (nonatomic, assign) BOOL hasBaseReal;
@@ -54,6 +69,10 @@ static NSString *const kKeyLastReal    = @"BT_lastReal";
 @property (nonatomic, assign) BOOL hasLastReal;
 @property (nonatomic, assign) int64_t lastReal;
 @property (nonatomic, assign) int64_t computedDisplay;
+@property (nonatomic, assign) BOOL hasDelta;
+@property (nonatomic, assign) int64_t delta;
+@property (nonatomic, copy) NSString *lastSyncSource;
+@property (nonatomic, strong) NSDate *lastSyncDate;
 @end
 
 @implementation BTPrefsSnapshot
@@ -64,21 +83,27 @@ static NSString *const kKeyLastReal    = @"BT_lastReal";
 - (BTPrefsSnapshot *)snapshot;
 - (void)applyBaseDisplay:(int64_t)display;
 - (void)setEnabled:(BOOL)enabled;
+- (void)setSafeMode:(BOOL)safeMode;
+- (BOOL)realignBaseToCurrentReal;
 - (void)reset;
 // 原子更新真实余额并计算本次是否需要改写以及目标显示值
 - (void)recordRealBalance:(int64_t)realVal
+                   source:(NSString *)source
                outDisplay:(int64_t *)outDisplay
               shouldPatch:(BOOL *)shouldPatch;
 @end
 
 @implementation BTPrefs {
     BOOL _enabled;
+    BOOL _safeMode;
     BOOL _hasBaseDisplay;
     int64_t _baseDisplay;
     BOOL _hasBaseReal;
     int64_t _baseReal;
     BOOL _hasLastReal;
     int64_t _lastReal;
+    NSString *_lastSyncSource;
+    NSDate *_lastSyncDate;
 }
 
 + (BTPrefs *)shared {
@@ -93,6 +118,7 @@ static NSString *const kKeyLastReal    = @"BT_lastReal";
     if (self) {
         NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
         _enabled = [d boolForKey:kKeyEnabled];
+        _safeMode = [d boolForKey:kKeySafeMode];
 
         NSNumber *bd = [d objectForKey:kKeyBaseDisplay];
         if ([bd isKindOfClass:[NSNumber class]]) {
@@ -115,8 +141,16 @@ static NSString *const kKeyLastReal    = @"BT_lastReal";
     return self;
 }
 
+- (void)_notifyStateChanged {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:BTBalanceDidUpdateNotification
+                                                            object:nil];
+    });
+}
+
 - (int64_t)_lockedComputedDisplay {
-    return bt_compute_display(_enabled,
+    BOOL effectiveEnabled = (_enabled && !_safeMode);
+    return bt_compute_display(effectiveEnabled,
                               _hasBaseDisplay, _baseDisplay,
                               _hasBaseReal, _baseReal,
                               _hasLastReal ? _lastReal : 0);
@@ -126,6 +160,7 @@ static NSString *const kKeyLastReal    = @"BT_lastReal";
     @synchronized (self) {
         BTPrefsSnapshot *s = [[BTPrefsSnapshot alloc] init];
         s.enabled = _enabled;
+        s.safeMode = _safeMode;
         s.hasBaseDisplay = _hasBaseDisplay;
         s.baseDisplay = _baseDisplay;
         s.hasBaseReal = _hasBaseReal;
@@ -133,6 +168,10 @@ static NSString *const kKeyLastReal    = @"BT_lastReal";
         s.hasLastReal = _hasLastReal;
         s.lastReal = _lastReal;
         s.computedDisplay = [self _lockedComputedDisplay];
+        s.hasDelta = (_hasBaseReal && _hasLastReal);
+        s.delta = s.hasDelta ? (_lastReal - _baseReal) : 0;
+        s.lastSyncSource = _lastSyncSource;
+        s.lastSyncDate = _lastSyncDate;
         return s;
     }
 }
@@ -153,12 +192,12 @@ static NSString *const kKeyLastReal    = @"BT_lastReal";
             _baseReal = _lastReal;
             [d setObject:@(_baseReal) forKey:kKeyBaseReal];
         } else {
-            // 尚未捕获过真实余额：清除旧基准，待下次 wallet/info 返回时自动锁定为基准
             _hasBaseReal = NO;
             _baseReal = 0;
             [d removeObjectForKey:kKeyBaseReal];
         }
     }
+    [self _notifyStateChanged];
 }
 
 - (void)setEnabled:(BOOL)enabled {
@@ -166,30 +205,71 @@ static NSString *const kKeyLastReal    = @"BT_lastReal";
         _enabled = enabled;
         [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kKeyEnabled];
     }
+    [self _notifyStateChanged];
+}
+
+- (void)setSafeMode:(BOOL)safeMode {
+    @synchronized (self) {
+        _safeMode = safeMode;
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        [d setBool:safeMode forKey:kKeySafeMode];
+        if (!safeMode) {
+            [d removeObjectForKey:@"BT_safemode"];
+        }
+    }
+    btSyncRuntimeHooksWithSafeMode(safeMode);
+    [self _notifyStateChanged];
+}
+
+- (BOOL)realignBaseToCurrentReal {
+    BOOL ok = NO;
+    @synchronized (self) {
+        if (_hasLastReal && _hasBaseDisplay) {
+            int64_t cur = [self _lockedComputedDisplay];
+            _baseDisplay = bt_clamp_display(cur);
+            _baseReal = _lastReal;
+            _hasBaseReal = YES;
+
+            NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+            [d setObject:@(_baseDisplay) forKey:kKeyBaseDisplay];
+            [d setObject:@(_baseReal) forKey:kKeyBaseReal];
+            ok = YES;
+        }
+    }
+    if (ok) [self _notifyStateChanged];
+    return ok;
 }
 
 - (void)reset {
     @synchronized (self) {
         _enabled = NO;
+        _safeMode = NO;
         _hasBaseDisplay = NO;
         _baseDisplay = 0;
         _hasBaseReal = NO;
         _baseReal = 0;
         _hasLastReal = NO;
         _lastReal = 0;
+        _lastSyncSource = nil;
+        _lastSyncDate = nil;
 
         NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
         [d removeObjectForKey:kKeyEnabled];
+        [d removeObjectForKey:kKeySafeMode];
+        [d removeObjectForKey:@"BT_safemode"];
         [d removeObjectForKey:kKeyBaseDisplay];
         [d removeObjectForKey:kKeyBaseReal];
         [d removeObjectForKey:kKeyLastReal];
     }
+    btSyncRuntimeHooksWithSafeMode(NO);
+    [self _notifyStateChanged];
 }
 
 - (void)recordRealBalance:(int64_t)realVal
+                   source:(NSString *)source
                outDisplay:(int64_t *)outDisplay
               shouldPatch:(BOOL *)shouldPatch {
-    BOOL didUpdateLastReal = NO;
+    BOOL didChange = NO;
     int64_t disp = realVal;
     BOOL patch = NO;
 
@@ -199,29 +279,32 @@ static NSString *const kKeyLastReal    = @"BT_lastReal";
             _hasLastReal = YES;
             _lastReal = realVal;
             [d setObject:@(realVal) forKey:kKeyLastReal];
-            didUpdateLastReal = YES;
+            didChange = YES;
         }
 
+        if (source.length > 0 && ![_lastSyncSource isEqualToString:source]) {
+            _lastSyncSource = [source copy];
+            didChange = YES;
+        }
+        _lastSyncDate = [NSDate date];
+
         // 若用户先点了应用、当时还没捕获到真实余额，则在首次捕获到真实余额时自动锁定基准
-        if (_enabled && _hasBaseDisplay && !_hasBaseReal) {
+        if (_enabled && !_safeMode && _hasBaseDisplay && !_hasBaseReal) {
             _hasBaseReal = YES;
             _baseReal = realVal;
             [d setObject:@(realVal) forKey:kKeyBaseReal];
-            didUpdateLastReal = YES;
+            didChange = YES;
         }
 
-        patch = (_enabled && _hasBaseDisplay);
+        patch = (_enabled && !_safeMode && _hasBaseDisplay);
         disp = [self _lockedComputedDisplay];
     }
 
     if (outDisplay) *outDisplay = disp;
     if (shouldPatch) *shouldPatch = patch;
 
-    if (didUpdateLastReal) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [[NSNotificationCenter defaultCenter] postNotificationName:BTBalanceDidUpdateNotification
-                                                                object:nil];
-        });
+    if (didChange) {
+        [self _notifyStateChanged];
     }
 }
 
@@ -243,7 +326,10 @@ static NSData *btHandleWalletInfo(NSData *data) {
 
     int64_t disp = realVal;
     BOOL shouldPatch = NO;
-    [[BTPrefs shared] recordRealBalance:realVal outDisplay:&disp shouldPatch:&shouldPatch];
+    [[BTPrefs shared] recordRealBalance:realVal
+                                 source:@"网络接口"
+                             outDisplay:&disp
+                            shouldPatch:&shouldPatch];
 
     if (!shouldPatch) {
         return data;
@@ -281,27 +367,45 @@ static BOOL btParseDisplayInput(NSString *raw, int64_t *outVal) {
 }
 
 // ============================================================
-// 设置界面
+// 设置界面（现代 iOS 分组卡片 UI + 安全模式开关 + 内置状态实时同步）
 // ============================================================
 @interface BTSettingsVC : UIViewController
 @end
 
 @implementation BTSettingsVC {
-    UILabel *_status;
+    UILabel *_badgeLabel;
+    UIView *_badgeBg;
+    UILabel *_syncLabel;
+    UILabel *_heroNumber;
+    UILabel *_realValLabel;
+    UILabel *_baseRealValLabel;
+    UILabel *_deltaValLabel;
     UITextField *_tf;
-    UIButton *_toggleBtn;
+    UISwitch *_enableSwitch;
+    UISwitch *_safeModeSwitch;
 }
 
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
++ (NSString *)formatNumber:(int64_t)val {
+    static NSNumberFormatter *nf = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        nf = [[NSNumberFormatter alloc] init];
+        nf.numberStyle = NSNumberFormatterDecimalStyle;
+        nf.groupingSeparator = @",";
+    });
+    return [nf stringFromNumber:@(val)] ?: [NSString stringWithFormat:@"%lld", (long long)val];
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor systemBackgroundColor];
-    self.title = @"钻石显示";
+    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    self.title = @"钻石显示设置";
     self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"关闭"
+        [[UIBarButtonItem alloc] initWithTitle:@"完成"
                                          style:UIBarButtonItemStyleDone
                                         target:self
                                         action:@selector(onClose)];
@@ -311,49 +415,48 @@ static BOOL btParseDisplayInput(NSString *raw, int64_t *outVal) {
     tap.cancelsTouchesInView = NO;
     [self.view addGestureRecognizer:tap];
 
+    UIScrollView *scroll = [[UIScrollView alloc] init];
+    scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    scroll.alwaysBounceVertical = YES;
+    scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+    [self.view addSubview:scroll];
+
+    UIStackView *stack = [[UIStackView alloc] init];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 16;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [scroll addSubview:stack];
+
+    UILayoutGuide *g = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [scroll.topAnchor constraintEqualToAnchor:g.topAnchor],
+        [scroll.bottomAnchor constraintEqualToAnchor:g.bottomAnchor],
+        [scroll.leadingAnchor constraintEqualToAnchor:g.leadingAnchor],
+        [scroll.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
+
+        [stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:16],
+        [stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-28],
+        [stack.leadingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.leadingAnchor constant:16],
+        [stack.trailingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor constant:-16],
+        [stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32],
+    ]];
+
+    // 1. 顶部余额状态主卡片
+    [stack addArrangedSubview:[self buildHeroCard]];
+
+    // 2. 自定义数值 + 快捷预设卡片
+    [stack addArrangedSubview:[self buildInputCard]];
+
+    // 3. 开关分组卡片（改写开关 + 安全模式）
+    [stack addArrangedSubview:[self buildSwitchGroupCard]];
+
+    // 4. 工具与重置分组卡片
+    [stack addArrangedSubview:[self buildActionGroupCard]];
+
     BTPrefsSnapshot *snap = [[BTPrefs shared] snapshot];
-
-    _status = [[UILabel alloc] init];
-    _status.numberOfLines = 0;
-    _status.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
-    _status.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:_status];
-
-    _tf = [[UITextField alloc] init];
-    _tf.placeholder = @"输入显示数字，如 1500254";
-    _tf.keyboardType = UIKeyboardTypeNumberPad;
-    _tf.borderStyle = UITextBorderStyleRoundedRect;
-    _tf.clearButtonMode = UITextFieldViewModeWhileEditing;
-    _tf.translatesAutoresizingMaskIntoConstraints = NO;
     if (snap.hasBaseDisplay) {
         _tf.text = [NSString stringWithFormat:@"%lld", snap.baseDisplay];
     }
-    [self.view addSubview:_tf];
-
-    UIButton *applyBtn = [self makeButtonWithTitle:@"应用（以当前真实余额为基准）" tag:0 destructive:NO];
-    _toggleBtn = [self makeButtonWithTitle:@"" tag:1 destructive:NO];
-    UIButton *resetBtn = [self makeButtonWithTitle:@"重置" tag:2 destructive:YES];
-    UIButton *logBtn = [self makeButtonWithTitle:@"查看日志" tag:3 destructive:NO];
-
-    NSArray<UIButton *> *btns = @[applyBtn, _toggleBtn, resetBtn, logBtn];
-
-    UILayoutGuide *g = self.view.safeAreaLayoutGuide;
-    NSMutableArray<NSLayoutConstraint *> *cs = [NSMutableArray array];
-    [cs addObject:[_status.topAnchor constraintEqualToAnchor:g.topAnchor constant:20]];
-    [cs addObject:[_status.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:20]];
-    [cs addObject:[_status.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-20]];
-    [cs addObject:[_tf.topAnchor constraintEqualToAnchor:_status.bottomAnchor constant:16]];
-    [cs addObject:[_tf.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:20]];
-    [cs addObject:[_tf.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-20]];
-    [cs addObject:[_tf.heightAnchor constraintEqualToConstant:40]];
-
-    UIView *prev = _tf;
-    for (UIButton *b in btns) {
-        [cs addObject:[b.topAnchor constraintEqualToAnchor:prev.bottomAnchor constant:12]];
-        [cs addObject:[b.centerXAnchor constraintEqualToAnchor:g.centerXAnchor]];
-        prev = b;
-    }
-    [NSLayoutConstraint activateConstraints:cs];
 
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(refresh)
@@ -363,43 +466,425 @@ static BOOL btParseDisplayInput(NSString *raw, int64_t *outVal) {
     [self refresh];
 }
 
-- (UIButton *)makeButtonWithTitle:(NSString *)title tag:(NSInteger)tag destructive:(BOOL)destructive {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    [b setTitle:title forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont systemFontOfSize:15];
-    b.translatesAutoresizingMaskIntoConstraints = NO;
-    b.tag = tag;
-    if (destructive) {
-        [b setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
+- (UIView *)makeCardContainer {
+    UIView *v = [[UIView alloc] init];
+    v.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    v.layer.cornerRadius = 16;
+    v.layer.masksToBounds = YES;
+    v.translatesAutoresizingMaskIntoConstraints = NO;
+    return v;
+}
+
+- (UIView *)makeHairline {
+    UIView *line = [[UIView alloc] init];
+    line.backgroundColor = [UIColor separatorColor];
+    line.translatesAutoresizingMaskIntoConstraints = NO;
+    [line.heightAnchor constraintEqualToConstant:(1.0 / [UIScreen mainScreen].scale)].active = YES;
+    return line;
+}
+
+- (UIView *)buildHeroCard {
+    UIView *card = [self makeCardContainer];
+
+    // 状态胶囊
+    _badgeBg = [[UIView alloc] init];
+    _badgeBg.layer.cornerRadius = 11;
+    _badgeBg.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:_badgeBg];
+
+    _badgeLabel = [[UILabel alloc] init];
+    _badgeLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+    _badgeLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [_badgeBg addSubview:_badgeLabel];
+
+    _syncLabel = [[UILabel alloc] init];
+    _syncLabel.font = [UIFont systemFontOfSize:11];
+    _syncLabel.textColor = [UIColor secondaryLabelColor];
+    _syncLabel.textAlignment = NSTextAlignmentRight;
+    _syncLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:_syncLabel];
+
+    UILabel *caption = [[UILabel alloc] init];
+    caption.text = @"当前显示钻石";
+    caption.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    caption.textColor = [UIColor secondaryLabelColor];
+    caption.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:caption];
+
+    _heroNumber = [[UILabel alloc] init];
+    _heroNumber.font = [UIFont monospacedDigitSystemFontOfSize:34 weight:UIFontWeightBold];
+    _heroNumber.textColor = [UIColor labelColor];
+    _heroNumber.adjustsFontSizeToFitWidth = YES;
+    _heroNumber.minimumScaleFactor = 0.6;
+    _heroNumber.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:_heroNumber];
+
+    UIView *sep = [self makeHairline];
+    [card addSubview:sep];
+
+    UIStackView *metrics = [[UIStackView alloc] init];
+    metrics.axis = UILayoutConstraintAxisHorizontal;
+    metrics.distribution = UIStackViewDistributionFillEqually;
+    metrics.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:metrics];
+
+    [metrics addArrangedSubview:[self buildMetricColumnWithTitle:@"真实余额" outValue:&_realValLabel]];
+    [metrics addArrangedSubview:[self buildMetricColumnWithTitle:@"基准真实" outValue:&_baseRealValLabel]];
+    [metrics addArrangedSubview:[self buildMetricColumnWithTitle:@"累计变化" outValue:&_deltaValLabel]];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_badgeBg.topAnchor constraintEqualToAnchor:card.topAnchor constant:16],
+        [_badgeBg.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [_badgeBg.heightAnchor constraintEqualToConstant:22],
+
+        [_badgeLabel.leadingAnchor constraintEqualToAnchor:_badgeBg.leadingAnchor constant:10],
+        [_badgeLabel.trailingAnchor constraintEqualToAnchor:_badgeBg.trailingAnchor constant:-10],
+        [_badgeLabel.centerYAnchor constraintEqualToAnchor:_badgeBg.centerYAnchor],
+
+        [_syncLabel.centerYAnchor constraintEqualToAnchor:_badgeBg.centerYAnchor],
+        [_syncLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [_syncLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:_badgeBg.trailingAnchor constant:8],
+
+        [caption.topAnchor constraintEqualToAnchor:_badgeBg.bottomAnchor constant:14],
+        [caption.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+
+        [_heroNumber.topAnchor constraintEqualToAnchor:caption.bottomAnchor constant:4],
+        [_heroNumber.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [_heroNumber.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+
+        [sep.topAnchor constraintEqualToAnchor:_heroNumber.bottomAnchor constant:16],
+        [sep.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [sep.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+
+        [metrics.topAnchor constraintEqualToAnchor:sep.bottomAnchor constant:12],
+        [metrics.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:8],
+        [metrics.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-8],
+        [metrics.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-14],
+    ]];
+    return card;
+}
+
+- (UIView *)buildMetricColumnWithTitle:(NSString *)title outValue:(UILabel * __strong *)outVal {
+    UIStackView *col = [[UIStackView alloc] init];
+    col.axis = UILayoutConstraintAxisVertical;
+    col.alignment = UIStackViewAlignmentCenter;
+    col.spacing = 4;
+
+    UILabel *val = [[UILabel alloc] init];
+    val.font = [UIFont monospacedDigitSystemFontOfSize:16 weight:UIFontWeightSemibold];
+    val.textColor = [UIColor labelColor];
+    val.adjustsFontSizeToFitWidth = YES;
+    val.minimumScaleFactor = 0.7;
+    if (outVal) *outVal = val;
+
+    UILabel *lbl = [[UILabel alloc] init];
+    lbl.text = title;
+    lbl.font = [UIFont systemFontOfSize:11];
+    lbl.textColor = [UIColor secondaryLabelColor];
+
+    [col addArrangedSubview:val];
+    [col addArrangedSubview:lbl];
+    return col;
+}
+
+- (UIView *)buildInputCard {
+    UIView *card = [self makeCardContainer];
+
+    UILabel *title = [[UILabel alloc] init];
+    title.text = @"自定义显示余额";
+    title.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    title.textColor = [UIColor labelColor];
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:title];
+
+    _tf = [[UITextField alloc] init];
+    _tf.placeholder = @"输入任意整数，如 1500254";
+    _tf.keyboardType = UIKeyboardTypeNumberPad;
+    _tf.font = [UIFont monospacedDigitSystemFontOfSize:18 weight:UIFontWeightMedium];
+    _tf.backgroundColor = [UIColor tertiarySystemFillColor];
+    _tf.layer.cornerRadius = 10;
+    _tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    _tf.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 12, 1)];
+    _tf.leftViewMode = UITextFieldViewModeAlways;
+    _tf.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:_tf];
+
+    UIButton *applyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [applyBtn setTitle:@"应用" forState:UIControlStateNormal];
+    [applyBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    applyBtn.backgroundColor = [UIColor systemBlueColor];
+    applyBtn.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    applyBtn.layer.cornerRadius = 10;
+    applyBtn.tag = 0;
+    applyBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [applyBtn addTarget:self action:@selector(onButton:) forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:applyBtn];
+
+    // 快捷预设胶囊
+    UIStackView *presets = [[UIStackView alloc] init];
+    presets.axis = UILayoutConstraintAxisHorizontal;
+    presets.distribution = UIStackViewDistributionFillEqually;
+    presets.spacing = 8;
+    presets.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:presets];
+
+    NSArray<NSString *> *presetTitles = @[@"10万", @"50万", @"100万", @"500万"];
+    NSArray<NSNumber *> *presetValues = @[@100000, @500000, @1000000, @5000000];
+    for (NSUInteger i = 0; i < presetTitles.count; i++) {
+        UIButton *chip = [UIButton buttonWithType:UIButtonTypeSystem];
+        [chip setTitle:presetTitles[i] forState:UIControlStateNormal];
+        chip.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+        chip.backgroundColor = [UIColor tertiarySystemFillColor];
+        [chip setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+        chip.layer.cornerRadius = 8;
+        chip.tag = 100 + (NSInteger)i;
+        objc_setAssociatedObject(chip, @selector(onPresetTap:), presetValues[i], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [chip addTarget:self action:@selector(onPresetTap:) forControlEvents:UIControlEventTouchUpInside];
+        [presets addArrangedSubview:chip];
     }
-    [b addTarget:self action:@selector(onButton:) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:b];
-    return b;
+
+    [NSLayoutConstraint activateConstraints:@[
+        [title.topAnchor constraintEqualToAnchor:card.topAnchor constant:14],
+        [title.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+
+        [_tf.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:10],
+        [_tf.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [_tf.heightAnchor constraintEqualToConstant:44],
+
+        [applyBtn.centerYAnchor constraintEqualToAnchor:_tf.centerYAnchor],
+        [applyBtn.leadingAnchor constraintEqualToAnchor:_tf.trailingAnchor constant:10],
+        [applyBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [applyBtn.widthAnchor constraintEqualToConstant:76],
+        [applyBtn.heightAnchor constraintEqualToConstant:44],
+
+        [presets.topAnchor constraintEqualToAnchor:_tf.bottomAnchor constant:10],
+        [presets.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [presets.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [presets.heightAnchor constraintEqualToConstant:30],
+        [presets.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-14],
+    ]];
+    return card;
+}
+
+- (UIView *)buildSwitchGroupCard {
+    UIView *card = [self makeCardContainer];
+    UIStackView *v = [[UIStackView alloc] init];
+    v.axis = UILayoutConstraintAxisVertical;
+    v.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:v];
+
+    UIView *enableRow = [self makeSwitchRowWithTitle:@"改写开关"
+                                            subtitle:@"关闭后立即恢复显示真实余额"
+                                           tintColor:[UIColor systemGreenColor]
+                                              action:@selector(onEnableSwitchChanged:)
+                                           outSwitch:&_enableSwitch];
+
+    UIView *safeRow = [self makeSwitchRowWithTitle:@"安全模式"
+                                          subtitle:@"开启后停用全部 Hook，保留当前配置，无需重启"
+                                         tintColor:[UIColor systemOrangeColor]
+                                            action:@selector(onSafeModeSwitchChanged:)
+                                         outSwitch:&_safeModeSwitch];
+
+    UIView *sepWrap = [[UIView alloc] init];
+    UIView *sep = [self makeHairline];
+    [sepWrap addSubview:sep];
+    [NSLayoutConstraint activateConstraints:@[
+        [sep.topAnchor constraintEqualToAnchor:sepWrap.topAnchor],
+        [sep.bottomAnchor constraintEqualToAnchor:sepWrap.bottomAnchor],
+        [sep.leadingAnchor constraintEqualToAnchor:sepWrap.leadingAnchor constant:16],
+        [sep.trailingAnchor constraintEqualToAnchor:sepWrap.trailingAnchor],
+    ]];
+
+    [v addArrangedSubview:enableRow];
+    [v addArrangedSubview:sepWrap];
+    [v addArrangedSubview:safeRow];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [v.topAnchor constraintEqualToAnchor:card.topAnchor],
+        [v.bottomAnchor constraintEqualToAnchor:card.bottomAnchor],
+        [v.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
+        [v.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
+    ]];
+    return card;
+}
+
+- (UIView *)makeSwitchRowWithTitle:(NSString *)title
+                          subtitle:(NSString *)subtitle
+                         tintColor:(UIColor *)tint
+                            action:(SEL)action
+                         outSwitch:(UISwitch * __strong *)outSwitch {
+    UIView *row = [[UIView alloc] init];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *t = [[UILabel alloc] init];
+    t.text = title;
+    t.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    t.translatesAutoresizingMaskIntoConstraints = NO;
+    [row addSubview:t];
+
+    UILabel *sub = [[UILabel alloc] init];
+    sub.text = subtitle;
+    sub.font = [UIFont systemFontOfSize:12];
+    sub.textColor = [UIColor secondaryLabelColor];
+    sub.numberOfLines = 0;
+    sub.translatesAutoresizingMaskIntoConstraints = NO;
+    [row addSubview:sub];
+
+    UISwitch *sw = [[UISwitch alloc] init];
+    sw.onTintColor = tint;
+    sw.translatesAutoresizingMaskIntoConstraints = NO;
+    [sw addTarget:self action:action forControlEvents:UIControlEventValueChanged];
+    [row addSubview:sw];
+    if (outSwitch) *outSwitch = sw;
+
+    [NSLayoutConstraint activateConstraints:@[
+        [sw.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-16],
+        [sw.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [t.topAnchor constraintEqualToAnchor:row.topAnchor constant:12],
+        [t.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:16],
+        [t.trailingAnchor constraintEqualToAnchor:sw.leadingAnchor constant:-12],
+        [sub.topAnchor constraintEqualToAnchor:t.bottomAnchor constant:2],
+        [sub.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:16],
+        [sub.trailingAnchor constraintEqualToAnchor:sw.leadingAnchor constant:-12],
+        [sub.bottomAnchor constraintEqualToAnchor:row.bottomAnchor constant:-12],
+    ]];
+    return row;
+}
+
+- (UIView *)buildActionGroupCard {
+    UIView *card = [self makeCardContainer];
+    UIStackView *v = [[UIStackView alloc] init];
+    v.axis = UILayoutConstraintAxisVertical;
+    v.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:v];
+
+    NSArray<NSDictionary *> *items = @[
+        @{@"title": @"对齐基准（保持当前显示值，清零累计变化）", @"tag": @1, @"destructive": @NO},
+        @{@"title": @"查看运行日志", @"tag": @3, @"destructive": @NO},
+        @{@"title": @"重置全部配置", @"tag": @2, @"destructive": @YES},
+    ];
+
+    for (NSUInteger i = 0; i < items.count; i++) {
+        NSDictionary *item = items[i];
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+        [btn setTitle:item[@"title"] forState:UIControlStateNormal];
+        btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+        btn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+        btn.contentEdgeInsets = UIEdgeInsetsMake(0, 16, 0, 16);
+        btn.tag = [item[@"tag"] integerValue];
+        if ([item[@"destructive"] boolValue]) {
+            [btn setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
+        } else {
+            [btn setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
+        }
+        [btn addTarget:self action:@selector(onButton:) forControlEvents:UIControlEventTouchUpInside];
+        [btn.heightAnchor constraintEqualToConstant:48].active = YES;
+        [v addArrangedSubview:btn];
+
+        if (i + 1 < items.count) {
+            UIView *sepWrap = [[UIView alloc] init];
+            UIView *sep = [self makeHairline];
+            [sepWrap addSubview:sep];
+            [NSLayoutConstraint activateConstraints:@[
+                [sep.topAnchor constraintEqualToAnchor:sepWrap.topAnchor],
+                [sep.bottomAnchor constraintEqualToAnchor:sepWrap.bottomAnchor],
+                [sep.leadingAnchor constraintEqualToAnchor:sepWrap.leadingAnchor constant:16],
+                [sep.trailingAnchor constraintEqualToAnchor:sepWrap.trailingAnchor],
+            ]];
+            [v addArrangedSubview:sepWrap];
+        }
+    }
+
+    [NSLayoutConstraint activateConstraints:@[
+        [v.topAnchor constraintEqualToAnchor:card.topAnchor],
+        [v.bottomAnchor constraintEqualToAnchor:card.bottomAnchor],
+        [v.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
+        [v.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
+    ]];
+    return card;
 }
 
 - (void)refresh {
     BTPrefsSnapshot *s = [[BTPrefs shared] snapshot];
-    NSString *realStr = s.hasLastReal ? [NSString stringWithFormat:@"%lld", s.lastReal] : @"未获取";
-    NSString *baseRealStr = s.hasBaseReal ? [NSString stringWithFormat:@"%lld", s.baseReal] : @"未设置";
-    NSString *baseDispStr = s.hasBaseDisplay ? [NSString stringWithFormat:@"%lld", s.baseDisplay] : @"未设置";
-    NSString *currDispStr = (s.hasLastReal || (s.enabled && s.hasBaseDisplay))
-        ? [NSString stringWithFormat:@"%lld", s.computedDisplay]
-        : @"未获取";
 
-    _status.text = [NSString stringWithFormat:
-        @"真实余额:   %@\n"
-        @"基准真实:   %@\n"
-        @"基准显示:   %@\n"
-        @"当前显示:   %@\n"
-        @"改写开关:   %@",
-        realStr, baseRealStr, baseDispStr, currDispStr,
-        s.enabled ? @"开" : @"关"];
+    // 状态胶囊样式
+    if (s.safeMode) {
+        _badgeLabel.text = @"● 安全模式";
+        _badgeLabel.textColor = [UIColor systemOrangeColor];
+        _badgeBg.backgroundColor = [[UIColor systemOrangeColor] colorWithAlphaComponent:0.15];
+    } else if (s.enabled && s.hasBaseDisplay) {
+        _badgeLabel.text = @"● 改写生效中";
+        _badgeLabel.textColor = [UIColor systemGreenColor];
+        _badgeBg.backgroundColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.15];
+    } else {
+        _badgeLabel.text = @"● 未开启";
+        _badgeLabel.textColor = [UIColor secondaryLabelColor];
+        _badgeBg.backgroundColor = [UIColor tertiarySystemFillColor];
+    }
 
-    [_toggleBtn setTitle:(s.enabled ? @"关闭改写" : @"开启改写") forState:UIControlStateNormal];
+    // 同步来源与时间
+    if (s.lastSyncSource.length > 0 && s.lastSyncDate) {
+        static NSDateFormatter *fmt = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            fmt = [[NSDateFormatter alloc] init];
+            fmt.dateFormat = @"HH:mm:ss";
+        });
+        _syncLabel.text = [NSString stringWithFormat:@"已同步 · %@ %@", s.lastSyncSource, [fmt stringFromDate:s.lastSyncDate]];
+    } else {
+        _syncLabel.text = @"等待余额同步…";
+    }
+
+    // 主数字
+    if (s.hasLastReal || (s.enabled && !s.safeMode && s.hasBaseDisplay)) {
+        _heroNumber.text = [BTSettingsVC formatNumber:s.computedDisplay];
+    } else {
+        _heroNumber.text = @"--";
+    }
+
+    // 三列指标
+    _realValLabel.text = s.hasLastReal ? [BTSettingsVC formatNumber:s.lastReal] : @"未获取";
+    _baseRealValLabel.text = s.hasBaseReal ? [BTSettingsVC formatNumber:s.baseReal] : @"未设置";
+    if (s.hasDelta) {
+        _deltaValLabel.text = [NSString stringWithFormat:@"%@%lld", (s.delta >= 0 ? @"+" : @""), s.delta];
+        if (s.delta > 0) {
+            _deltaValLabel.textColor = [UIColor systemGreenColor];
+        } else if (s.delta < 0) {
+            _deltaValLabel.textColor = [UIColor systemRedColor];
+        } else {
+            _deltaValLabel.textColor = [UIColor labelColor];
+        }
+    } else {
+        _deltaValLabel.text = @"--";
+        _deltaValLabel.textColor = [UIColor secondaryLabelColor];
+    }
+
+    [_enableSwitch setOn:s.enabled animated:NO];
+    [_safeModeSwitch setOn:s.safeMode animated:NO];
 }
 
 - (void)onDismissKeyboard {
     [self.view endEditing:YES];
+}
+
+- (void)onPresetTap:(UIButton *)sender {
+    NSNumber *n = objc_getAssociatedObject(sender, @selector(onPresetTap:));
+    if (!n) return;
+    _tf.text = [NSString stringWithFormat:@"%lld", [n longLongValue]];
+}
+
+- (void)onEnableSwitchChanged:(UISwitch *)sw {
+    [[BTPrefs shared] setEnabled:sw.isOn];
+    [self refresh];
+}
+
+- (void)onSafeModeSwitchChanged:(UISwitch *)sw {
+    BOOL on = sw.isOn;
+    [[BTPrefs shared] setSafeMode:on];
+    [self refresh];
+    [self toast:(on
+        ? @"已开启安全模式：全部 Hook 已即时暂停，配置已保留。"
+        : @"已关闭安全模式：全部 Hook 已即时恢复生效。")];
 }
 
 - (void)onButton:(UIButton *)sender {
@@ -417,23 +902,31 @@ static BOOL btParseDisplayInput(NSString *raw, int64_t *outVal) {
 
         BTPrefsSnapshot *s = [p snapshot];
         NSString *msg = s.hasBaseReal
-            ? [NSString stringWithFormat:@"已设置显示值 %lld（基准真实 %lld）", v, s.baseReal]
-            : [NSString stringWithFormat:@"已设置显示值 %lld（待首次获取真实余额后自动锁定基准）", v];
+            ? [NSString stringWithFormat:@"已设置显示值 %@（基准真实 %@）",
+               [BTSettingsVC formatNumber:v], [BTSettingsVC formatNumber:s.baseReal]]
+            : [NSString stringWithFormat:@"已设置显示值 %@（待首次获取真实余额后自动锁定基准）",
+               [BTSettingsVC formatNumber:v]];
+        if (s.safeMode) {
+            msg = [msg stringByAppendingString:@"\n注意：当前处于安全模式，关闭安全模式后立即生效。"];
+        }
         [self toast:msg];
     } else if (sender.tag == 1) {
-        BTPrefsSnapshot *s = [p snapshot];
-        [p setEnabled:!s.enabled];
-        [self refresh];
+        if ([p realignBaseToCurrentReal]) {
+            BTPrefsSnapshot *s = [p snapshot];
+            _tf.text = [NSString stringWithFormat:@"%lld", s.baseDisplay];
+            [self refresh];
+            [self toast:[NSString stringWithFormat:@"已对齐基准：基准显示 %@，基准真实 %@",
+                         [BTSettingsVC formatNumber:s.baseDisplay],
+                         [BTSettingsVC formatNumber:s.baseReal]]];
+        } else {
+            [self toast:@"请先获取真实余额并设置显示值后再对齐基准。"];
+        }
     } else if (sender.tag == 2) {
         [p reset];
         _tf.text = @"";
-        // 同时退出安全模式（用户主动重置 → 下次启动重新尝试 TTNetHook）
-        [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"BT_safemode"];
-        [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"BT_safemode_v5"];
         [self refresh];
-        [self toast:@"已重置。安全模式已关闭，重启 App 生效。"];
+        [self toast:@"已重置全部配置并关闭安全模式。"];
     } else if (sender.tag == 3) {
-        // 查看日志
         BTLogVC *vc = [[BTLogVC alloc] init];
         [self.navigationController pushViewController:vc animated:YES];
     }
@@ -667,6 +1160,8 @@ static NSData *btPatchHomepageJSONData(NSData *data) {
     if (!jsonObj) return nil;
 
     BTPrefsSnapshot *snap = [[BTPrefs shared] snapshot];
+    if (snap.safeMode) return nil;
+
     BOOL shouldPatch = (snap.enabled && snap.hasBaseDisplay);
     int64_t detectedReal = -1;
     BOOL didChange = NO;
@@ -682,7 +1177,10 @@ static NSData *btPatchHomepageJSONData(NSData *data) {
     if (detectedReal >= 0) {
         int64_t newDisp = 0;
         BOOL newPatch = NO;
-        [[BTPrefs shared] recordRealBalance:detectedReal outDisplay:&newDisp shouldPatch:&newPatch];
+        [[BTPrefs shared] recordRealBalance:detectedReal
+                                     source:@"钱包首页"
+                                 outDisplay:&newDisp
+                                shouldPatch:&newPatch];
         // 若此前尚未捕获过真实余额，刚捕获后重算一次显示值再补改
         if (!snap.hasLastReal && newPatch && !didChange) {
             patchedObj = BTPatchWalletJSONObject(jsonObj,
@@ -708,6 +1206,7 @@ static NSData *btPatchHomepageJSONData(NSData *data) {
 
 static NSData *btProtocolPatch(NSURL *url, NSData *data) {
     if (!url || !data || data.length < 4) return nil;
+    if ([[BTPrefs shared] snapshot].safeMode) return nil;
 
     NSString *path = (url.path.length > 0 ? url.path : (url.absoluteString ?: @"")).lowercaseString;
 
@@ -733,6 +1232,7 @@ static NSData *btProtocolPatch(NSURL *url, NSData *data) {
     int64_t display = 0;
     BOOL shouldPatch = NO;
     [[BTPrefs shared] recordRealBalance:realVal
+                                 source:@"网络接口"
                              outDisplay:&display
                             shouldPatch:&shouldPatch];
 
@@ -759,14 +1259,17 @@ static NSData *btProtocolPatch(NSURL *url, NSData *data) {
 // ============================================================
 // 方案 2（钱包 Model / Manager 层）回调桥接
 // ============================================================
-static void btWalletRecordReal(int64_t realVal) {
-    [[BTPrefs shared] recordRealBalance:realVal outDisplay:NULL shouldPatch:NULL];
+static void btWalletRecordReal(int64_t realVal, NSString *source) {
+    [[BTPrefs shared] recordRealBalance:realVal
+                                 source:(source ?: @"直播钱包")
+                             outDisplay:NULL
+                            shouldPatch:NULL];
 }
 
 static BOOL btWalletGetDisplay(int64_t *outDisplay, int64_t *outLastReal) {
     BTPrefsSnapshot *s = [[BTPrefs shared] snapshot];
     if (outLastReal) *outLastReal = s.hasLastReal ? s.lastReal : 0;
-    if (!s.enabled || !s.hasBaseDisplay) return NO;
+    if (s.safeMode || !s.enabled || !s.hasBaseDisplay) return NO;
     if (outDisplay) *outDisplay = s.computedDisplay;
     return YES;
 }
@@ -777,32 +1280,30 @@ static BOOL btWalletGetDisplay(int64_t *outDisplay, int64_t *outLastReal) {
 __attribute__((constructor))
 static void BTInit(void) {
     // ============================================================
-    // 崩溃自动降级保护（v5 独立 key，避免被旧版 v3 崩溃锁在安全模式）
+    // 崩溃自动降级保护
     // ============================================================
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
                                                           NSUserDomainMask, YES) firstObject];
     NSString *flag = [docs stringByAppendingPathComponent:@"BT_booting_v5.flag"];
     BOOL crashed = [[NSFileManager defaultManager] fileExistsAtPath:flag];
     if (crashed) {
-        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"BT_safemode_v5"];
+        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kKeySafeMode];
         [[NSFileManager defaultManager] removeItemAtPath:flag error:nil];
     }
     [[NSFileManager defaultManager] createFileAtPath:flag contents:[NSData data] attributes:nil];
 
-    BOOL safeMode = [[NSUserDefaults standardUserDefaults] boolForKey:@"BT_safemode_v5"];
+    BOOL safeMode = [[BTPrefs shared] snapshot].safeMode;
 
-    BTLOG(@"================ 加载 (v6+Wallet+Homepage) ================");
-    if (crashed) BTLOG(@"⚠ 检测到上次崩溃 → 已进入安全模式");
+    BTLOG(@"================ 加载 (v7+SafeMode+SyncUI) ================");
+    if (crashed) BTLOG(@"⚠ 检测到上次崩溃 → 已自动开启安全模式");
     BTLOG(@"安全模式: %@", safeMode ? @"开" : @"关");
     BTLOG(@"三指长按 1 秒 → 打开设置");
 
-    // ★ 方案 2（主力）：钱包 Model/Manager 层纯 ObjC Hook
+    // 绑定回调（即使处于安全模式，先绑定好回调以便随时关闭安全模式即时生效）
     BTSetWalletCallbacks(btWalletRecordReal, btWalletGetDisplay);
-
-    // ★ 钱包首页 JSON Hook（TTNet PreProcessing + BDXBridgeTtcjpayMultiNetRequestMethod）
     BTSetTTNetPatchFunc(btProtocolPatch);
 
-    // ★ 兜底：NSURLProtocol + NSURLSession completion hook
+    // 兜底网络层
     BTInstallURLProtocol();
     BTSetPatchFunc(btProtocolPatch);
     [BTNet install];
@@ -812,6 +1313,11 @@ static void BTInit(void) {
         if (!safeMode) {
             BTInstallWalletModelHook();
             BTInstallTTNetProbe();
+            BTSetWalletHookActive(YES);
+            BTSetTTNetActive(YES);
+        } else {
+            BTSetWalletHookActive(NO);
+            BTSetTTNetActive(NO);
         }
         [BTGesture install];
         // 初始化完成 → 删 flag（表示这次没崩）

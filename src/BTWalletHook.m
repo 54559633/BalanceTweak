@@ -27,6 +27,7 @@
 
 static BTWalletRecordRealFunc g_recordReal = NULL;
 static BTWalletGetDisplayFunc g_getDisplay = NULL;
+static _Atomic bool g_walletActive = true;
 static _Atomic int g_setLogCount = 0;
 static _Atomic int g_getLogCount = 0;
 
@@ -36,11 +37,16 @@ void BTSetWalletCallbacks(BTWalletRecordRealFunc recordFunc,
     g_getDisplay = getDisplayFunc;
 }
 
+void BTSetWalletHookActive(BOOL active) {
+    atomic_store(&g_walletActive, active ? true : false);
+    WHLOG(@"运行状态切换: %@", active ? @"启用" : @"暂停（安全模式）");
+}
+
 // ============================================================
 // 真实余额记录（带回声防护）
 // ============================================================
 static void btWalletRecordSafe(const char *tag, const char *clsName, const char *selName, int64_t val) {
-    if (!g_recordReal || val < 0) return;
+    if (!atomic_load(&g_walletActive) || !g_recordReal || val < 0) return;
 
     if (g_getDisplay) {
         int64_t curDisp = 0;
@@ -52,7 +58,7 @@ static void btWalletRecordSafe(const char *tag, const char *clsName, const char 
         }
     }
 
-    g_recordReal(val);
+    g_recordReal(val, @"直播钱包");
 
     int c = atomic_fetch_add(&g_setLogCount, 1);
     if (c < 30) {
@@ -62,6 +68,8 @@ static void btWalletRecordSafe(const char *tag, const char *clsName, const char 
 
 static BOOL btWalletComputeGetterValue(const char *clsName, const char *selName,
                                        int64_t origVal, int64_t *outVal) {
+    if (!atomic_load(&g_walletActive)) return NO;
+
     // 仅当 getter 读到 > 0 的值时才同步 lastReal（避免未初始化对象默认返回 0 误锁基准；真实归零由 setter 记录）
     if (origVal > 0) {
         btWalletRecordSafe("GET-SYNC", clsName, selName, origVal);
@@ -85,6 +93,7 @@ static BOOL btWalletComputeGetterValue(const char *clsName, const char *selName,
 
 // 尝试从纯数字展示字符串（如 "13"）解析真实余额，仅在未启用改写或非回声时记录
 static void btWalletTryRecordFromString(const char *clsName, const char *selName, NSString *s) {
+    if (!atomic_load(&g_walletActive)) return;
     if (![s isKindOfClass:[NSString class]] || s.length == 0 || s.length > 18) return;
     uint64_t acc = 0;
     for (NSUInteger i = 0; i < s.length; i++) {
@@ -114,6 +123,7 @@ static void btHookDisplayStringGetter(Class cls, const char *clsName, const char
     Fn fn = (Fn)origImp;
     id (^blk)(id) = ^id(id self_) {
         id origObj = fn(self_, sel);
+        if (!atomic_load(&g_walletActive)) return origObj;
         if ([origObj isKindOfClass:[NSString class]]) {
             btWalletTryRecordFromString(clsName, selName, (NSString *)origObj);
         }

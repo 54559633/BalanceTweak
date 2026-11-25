@@ -26,8 +26,13 @@ void BTSetTTNetPatchFunc(BTTTNetPatchFunc func) {
     g_patchFunc = func;
 }
 
+void BTSetTTNetActive(BOOL active) {
+    g_active = active;
+    TTHLOG(@"运行状态切换: %@", active ? @"启用" : @"暂停（安全模式）");
+}
+
 void BTStopTTNetProbe(void) {
-    g_active = NO;
+    BTSetTTNetActive(NO);
 }
 
 // ============================================================
