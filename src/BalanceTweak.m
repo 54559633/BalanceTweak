@@ -426,7 +426,10 @@ static BOOL btParseDisplayInput(NSString *raw, int64_t *outVal) {
     } else if (sender.tag == 2) {
         [p reset];
         _tf.text = @"";
+        // 同时退出安全模式（用户主动重置 → 下次启动重新尝试 TTNetProbe）
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"BT_safemode"];
         [self refresh];
+        [self toast:@"已重置。安全模式已关闭，重启 App 生效。"];
     } else if (sender.tag == 3) {
         // 查看日志
         BTLogVC *vc = [[BTLogVC alloc] init];
@@ -706,15 +709,38 @@ static NSData *btProtocolPatch(NSURL *url, NSData *data) {
 // ============================================================
 __attribute__((constructor))
 static void BTInit(void) {
+    // ============================================================
+    // 崩溃自动降级保护
+    //   每次启动先写 flag，初始化完成后删 flag
+    //   若下次启动 flag 还在 → 上次崩了 → 启用安全模式（跳过 TTNetProbe）
+    // ============================================================
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                          NSUserDomainMask, YES) firstObject];
+    NSString *flag = [docs stringByAppendingPathComponent:@"BT_booting.flag"];
+    BOOL crashed = [[NSFileManager defaultManager] fileExistsAtPath:flag];
+    if (crashed) {
+        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"BT_safemode"];
+        [[NSFileManager defaultManager] removeItemAtPath:flag error:nil];
+    }
+    [[NSFileManager defaultManager] createFileAtPath:flag contents:[NSData data] attributes:nil];
+
+    BOOL safeMode = [[NSUserDefaults standardUserDefaults] boolForKey:@"BT_safemode"];
+
     BTLOG(@"================ 加载 ================");
+    if (crashed) BTLOG(@"⚠ 检测到上次崩溃 → 已进入安全模式");
+    BTLOG(@"安全模式: %@  flag=%@", safeMode ? @"开" : @"关", flag);
     BTLOG(@"三指长按 1 秒 → 打开设置");
 
     // ★ 方案 A：NSURLProtocol 拦截（最稳，覆盖所有 NSURLSession 请求）
     BTInstallURLProtocol();
     BTSetPatchFunc(btProtocolPatch);
 
-    // ★ 方案 C：TTNet 探测（抖音不走 NSURLSession 时）
-    BTInstallTTNetProbe();
+    // ★ 方案 C：TTNet 探测（安全模式下跳过）
+    if (!safeMode) {
+        BTInstallTTNetProbe();
+    } else {
+        BTLOG(@"安全模式：跳过 TTNetProbe（可在设置界面点「重置」恢复）");
+    }
 
     // ★ 方案 D：SSL_read 底层 hook（BoringSSL）
     // BTInstallSSLHook();  // 未越狱禁用（fishhook 改 GOT 触发 AMFI 崩溃）
@@ -725,6 +751,8 @@ static void BTInit(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [BTGesture install];
-        BTLOG(@"初始化完成");
+        // 初始化完成 → 删 flag（表示这次没崩）
+        [[NSFileManager defaultManager] removeItemAtPath:flag error:nil];
+        BTLOG(@"初始化完成（已清除启动标记）");
     });
 }
