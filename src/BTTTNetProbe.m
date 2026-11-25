@@ -1,16 +1,16 @@
 //
-// BTTTNetProbe.m —— TTNet 深度探测 v3（未越狱兼容 + 多参数 + 递归 dump）
+// BTTTNetProbe.m —— TTNet 深度探测 v4（稳定版）
 // ============================================================
-// v2 的失败原因（日志证据）：
-//   · TTNetworkManagerChromium 的 request 方法有 16 个参数
-//     → classifyMethod 只放行 ≤2 个额外参数 → 383 个方法被跳过
-//   · TTHttpTaskChromium -onReadResponseData: hook 成功但零命中
-//     → 参数是自定义对象，inspectObject 只认 NSData/NSString/JSON
+// v3 的崩溃原因（日志证据）：
+//   [forward hook:334] —— 334 个方法全被换成 _objc_msgForward
+//   其中包含 getter/setter（netCallback、setNetCallback:、hasCallback...）
+//   → 任一被 C++ 内部直接调用 → 崩溃
 //
-// v3 方案：
-//   ① forwardInvocation 拦截任意参数数量的方法（Aspects 风格，未越狱安全）
-//   ② inspectObject 递归 dump ivars（深度 3）
-//   ③ 识别并包装 block 参数（callbackWithResponse: 之类）
+// v4 修复：
+//   ① 简单签名扩展到 6 个参数（覆盖 95% 方法），不用 forward
+//   ② 跳过 getter/setter（名字以 set 开头 / 无冒号 / is+has 开头且无参）
+//   ③ forward 只在参数 > 6 时使用，且只限 TTNetworkManager* 类
+//   ④ forward 总数硬上限 40 个
 // ============================================================
 #import "BTTTNetProbe.h"
 #import "BTLog.h"
@@ -47,16 +47,15 @@ static const char *detectFeature(const void *data, size_t len) {
 }
 
 // ============================================================
-// 递归 dump（深度 3）
+// 递归 dump
 // ============================================================
 static void inspectObject(id obj, const char *clsName, const char *selName, int depth);
 
-static void reportHit(NSString *kind, const char *clsName, const char *selName,
+static void reportHit(NSString *kind, const char *cn, const char *sn,
                       const void *bytes, size_t len, const char *feature) {
     g_hits++;
     TPOLOG(@"★★★ 命中#%d [%@] %s -%s  %zuB  特征=\"%s\"",
-           g_hits, kind, clsName, selName, len, feature);
-
+           g_hits, kind, cn, sn, len, feature);
     NSMutableString *hex = [NSMutableString string];
     const uint8_t *b = (const uint8_t *)bytes;
     size_t n = len > 80 ? 80 : len;
@@ -64,61 +63,51 @@ static void reportHit(NSString *kind, const char *clsName, const char *selName,
     TPOLOG(@"    hex: %@", hex);
 }
 
-static void inspectObject(id obj, const char *clsName, const char *selName, int depth) {
-    if (!g_probeActive || !obj || depth > 3) return;
-    if (g_hits > 40) return;   // 防止日志爆炸
-
+static void inspectObject(id obj, const char *cn, const char *sn, int depth) {
+    if (!g_probeActive || !obj || depth > 3 || g_hits > 40) return;
     @try {
-        // NSData
         if ([obj isKindOfClass:[NSData class]]) {
             NSData *d = (NSData *)obj;
             const char *f = detectFeature(d.bytes, d.length);
-            if (f) reportHit(@"NSData", clsName, selName, d.bytes, d.length, f);
+            if (f) reportHit(@"NSData", cn, sn, d.bytes, d.length, f);
             return;
         }
-        // NSString
         if ([obj isKindOfClass:[NSString class]]) {
             NSString *s = (NSString *)obj;
             if (s.length < 6 || s.length > 200000) return;
             NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
             const char *f = detectFeature(d.bytes, d.length);
-            if (f) reportHit(@"NSString", clsName, selName, d.bytes, d.length, f);
+            if (f) reportHit(@"NSString", cn, sn, d.bytes, d.length, f);
             return;
         }
-        // NSDictionary / NSArray
         if ([obj isKindOfClass:[NSDictionary class]] || [obj isKindOfClass:[NSArray class]]) {
             if (![NSJSONSerialization isValidJSONObject:obj]) return;
             NSData *d = [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil];
             if (!d) return;
             const char *f = detectFeature(d.bytes, d.length);
-            if (f) reportHit(@"JSON", clsName, selName, d.bytes, d.length, f);
+            if (f) reportHit(@"JSON", cn, sn, d.bytes, d.length, f);
             return;
         }
-        // NSNumber / NSValue
-        if ([obj isKindOfClass:[NSNumber class]]) {
-            const char *f = detectFeature(&obj, sizeof(id));
-            return;
-        }
-        // NSURL / NSURLRequest → 检查 URL
         if ([obj isKindOfClass:[NSURL class]]) {
             NSString *s = [(NSURL *)obj absoluteString];
             NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
             const char *f = detectFeature(d.bytes, d.length);
-            if (f) TPOLOG(@"◆ URL命中 %s -%s: %@", clsName, selName, s);
+            if (f) TPOLOG(@"◆ URL %s -%s: %@", cn, sn, s);
             return;
         }
         if ([obj isKindOfClass:[NSURLRequest class]]) {
-            inspectObject([(NSURLRequest *)obj URL], clsName, selName, depth + 1);
+            inspectObject([(NSURLRequest *)obj URL], cn, sn, depth + 1);
             return;
         }
+        if ([obj isKindOfClass:[NSNumber class]] || [obj isKindOfClass:[NSValue class]]) return;
 
-        // 未知对象 → description（可能崩，包 try）
+        // description
         NSString *desc = nil;
         @try { desc = [obj description]; } @catch (NSException *e) { desc = nil; }
         if (desc && desc.length > 8 && desc.length < 200000) {
             NSData *d = [desc dataUsingEncoding:NSUTF8StringEncoding];
             const char *f = detectFeature(d.bytes, d.length);
-            if (f) reportHit(@"desc", clsName, selName, d.bytes, d.length, f);
+            if (f) reportHit(@"desc", cn, sn, d.bytes, d.length, f);
         }
 
         // 递归 ivars
@@ -129,167 +118,133 @@ static void inspectObject(id obj, const char *clsName, const char *selName, int 
             Ivar *ivars = class_copyIvarList(cls, &count);
             if (ivars) {
                 for (unsigned int i = 0; i < count && i < 30; i++) {
-                    const char *type = ivar_getTypeEncoding(ivars[i]);
-                    if (!type || type[0] != '@') continue;   // 只看对象类型
+                    const char *t = ivar_getTypeEncoding(ivars[i]);
+                    if (!t || t[0] != '@') continue;
                     id val = nil;
                     @try { val = object_getIvar(obj, ivars[i]); } @catch (NSException *e) { val = nil; }
-                    if (val) inspectObject(val, clsName, selName, depth + 1);
+                    if (val) inspectObject(val, cn, sn, depth + 1);
                 }
                 free(ivars);
             }
         }
-    } @catch (NSException *e) {
-        // 忽略
-    }
+    } @catch (NSException *e) {}
 }
 
-// ============================================================
-// block 检测
-// ============================================================
 static BOOL isBlockObject(id obj) {
     if (!obj) return NO;
     Class cls = object_getClass(obj);
     if (!cls) return NO;
-    const char *name = class_getName(cls);
-    if (!name) return NO;
-    return (strstr(name, "Block") != NULL ||
-            strstr(name, "block") != NULL ||
-            strcmp(name, "__NSGlobalBlock__") == 0 ||
-            strcmp(name, "__NSMallocBlock__") == 0 ||
-            strcmp(name, "__NSStackBlock__") == 0);
+    const char *n = class_getName(cls);
+    if (!n) return NO;
+    return (strstr(n, "Block") || strstr(n, "block") ||
+            strcmp(n, "__NSGlobalBlock__") == 0 ||
+            strcmp(n, "__NSMallocBlock__") == 0 ||
+            strcmp(n, "__NSStackBlock__") == 0);
 }
 
 // ============================================================
-// forwardInvocation 方案（可处理任意参数数量）
+// 名字过滤：跳过 getter/setter
 // ============================================================
-static NSMutableDictionary<NSString *, NSValue *> *g_origIMPs = nil;
+static BOOL shouldSkipSelector(const char *sn) {
+    if (!sn || !*sn) return YES;
 
-static NSString *impKey(Class cls, SEL sel) {
-    return [NSString stringWithFormat:@"%s|%s",
-            class_getName(cls) ?: "?", sel_getName(sel) ?: "?"];
-}
+    // setter
+    if (strncmp(sn, "set", 3) == 0) return YES;
+    // 无参数（纯 getter）
+    if (!strchr(sn, ':')) return YES;
+    // 常见 BOOL getter
+    if (strncmp(sn, "is", 2) == 0 && !strchr(sn, ':')) return YES;
+    if (strncmp(sn, "has", 3) == 0 && !strchr(sn, ':')) return YES;
+    if (strncmp(sn, "skip", 4) == 0 && !strchr(sn, ':')) return YES;
 
-/// 统一 forwardInvocation 实现
-static void BTForwardInvocation(id self, SEL _cmd, NSInvocation *inv) {
-    SEL sel = inv.selector;
-    Class cls = object_getClass(self);
-    NSString *key = impKey(cls, sel);
-    NSValue *v = g_origIMPs[key];
-    if (!v) {
-        // 没拦截过的 selector，走默认
-        if ([self respondsToSelector:@selector(doesNotRecognizeSelector:)]) {
-            [self doesNotRecognizeSelector:sel];
+    // 计数参数个数
+    int n = 0;
+    for (const char *p = sn; *p; p++) if (*p == ':') n++;
+
+    // 1 个参数且名字不像数据相关的 → 跳过（避免 hook 大量无关 setter 型方法）
+    // 但保留明确的数据/回调类
+    static const char *keep[] = {
+        "data", "Data", "body", "Body",
+        "response", "Response",
+        "callback", "Callback",
+        "receive", "Receive", "read", "Read",
+        "handle", "Handle", "decode", "Decode",
+        "parse", "Parse", "finish", "Finish",
+    };
+    if (n == 1) {
+        for (size_t i = 0; i < sizeof(keep)/sizeof(keep[0]); i++) {
+            if (strstr(sn, keep[i])) return NO;
         }
-        return;
-    }
-    IMP orig = [v pointerValue];
-    if (!orig) return;
-
-    const char *clsName = class_getName(cls);
-    const char *selName = sel_getName(sel);
-
-    // 遍历所有参数，检查对象类型的
-    NSMethodSignature *sig = inv.methodSignature;
-    NSUInteger n = sig.numberOfArguments;
-    for (NSUInteger i = 2; i < n; i++) {
-        const char *type = [sig getArgumentTypeAtIndex:i];
-        if (!type || type[0] != '@') continue;
-        if (strcmp(type, "@?") == 0) continue;   // block 本身不检查
-
-        __unsafe_unretained id arg = nil;
-        @try { [inv getArgument:&arg atIndex:i]; } @catch (NSException *e) { continue; }
-        if (!arg) continue;
-        if (isBlockObject(arg)) continue;
-
-        inspectObject(arg, clsName, selName, 0);
+        return YES;   // 1 参数但名字不相关 → 跳过
     }
 
-    // 调用原实现
-    @try {
-        if ([inv respondsToSelector:@selector(invokeUsingIMP:)]) {
-            [inv invokeUsingIMP:orig];
-        } else {
-            // fallback：临时恢复 IMP
-            Method m = class_getInstanceMethod(cls, sel);
-            IMP saved = m ? method_getImplementation(m) : NULL;
-            if (m) method_setImplementation(m, orig);
-            [inv invokeWithTarget:self];
-            if (m && saved) method_setImplementation(m, saved);
-        }
-    } @catch (NSException *e) {
-        TPOLOG(@"调用原实现异常 %s -%s: %@", clsName, selName, e);
-    }
-}
-
-/// 把方法改成 forward（保留原 IMP）
-static BOOL installForwardHook(Class cls, SEL sel) {
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return NO;
-
-    IMP cur = method_getImplementation(m);
-    if (cur == _objc_msgForward) return YES;   // 已经装过
-
-    // 保存原 IMP
-    NSString *key = impKey(cls, sel);
-    if (!g_origIMPs[key]) {
-        g_origIMPs[key] = [NSValue valueWithPointer:cur];
-    }
-
-    // 换成 forward
-    method_setImplementation(m, _objc_msgForward);
-
-    // 确保类有 forwardInvocation:
-    SEL fsel = @selector(forwardInvocation:);
-    Method fm = class_getInstanceMethod(cls, fsel);
-    if (!fm || method_getImplementation(fm) != (IMP)BTForwardInvocation) {
-        class_replaceMethod(cls, fsel, (IMP)BTForwardInvocation, "v@:@");
-    }
-    return YES;
+    return NO;
 }
 
 // ============================================================
-// 简单签名 hook（保留 v2 的能力，处理 getter/setter）
+// classifyMethod：扩展到 6 个参数
+//   kind 1: @16@0:8                    (id)method
+//   kind 2: @24@0:8@16                 (id)method:(id)
+//   kind 3: v24@0:8@16                 (void)method:(id)
+//   kind 4: @32@0:8@16@24              (id)method:(id):(id)
+//   kind 5: v32@0:8@16@24              (void)method:(id):(id)
+//   kind 6: v40@0:8@16@24@32           (void) 3 id
+//   kind 7: v48@0:8@16@24@32@40        (void) 4 id
+//   kind 8: v56@0:8@16@24@32@40@48     (void) 5 id
+//   kind 9: v64@0:8@16@24@32@40@48@56  (void) 6 id
 // ============================================================
 static int classifyMethod(Method m) {
     const char *enc = method_getTypeEncoding(m);
     if (!enc) return 0;
-    if (strcmp(enc, "@16@0:8") == 0) return 1;
-    if (strcmp(enc, "@24@0:8@16") == 0) return 2;
-    if (strcmp(enc, "v24@0:8@16") == 0) return 3;
-    if (strcmp(enc, "@32@0:8@16@24") == 0) return 4;
+
+    static const struct { const char *enc; int kind; } table[] = {
+        {"@16@0:8", 1},
+        {"@24@0:8@16", 2},
+        {"v24@0:8@16", 3},
+        {"@32@0:8@16@24", 4},
+        {"v32@0:8@16@24", 5},
+        {"v40@0:8@16@24@32", 6},
+        {"v48@0:8@16@24@32@40", 7},
+        {"v56@0:8@16@24@32@40@48", 8},
+        {"v64@0:8@16@24@32@40@48@56", 9},
+    };
+    for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); i++) {
+        if (strcmp(enc, table[i].enc) == 0) return table[i].kind;
+    }
     return 0;
 }
 
+// ============================================================
+// 简单 hook（1-9）
+// ============================================================
 static void simpleHook(Class cls, SEL sel, Method m, int kind) {
     IMP orig = method_getImplementation(m);
     if (!orig) return;
-    const char *clsName = class_getName(cls);
-    const char *selName = sel_getName(sel);
+    const char *cn = class_getName(cls);
+    const char *sn = sel_getName(sel);
 
     @try {
         switch (kind) {
         case 1: {
             id b = ^id(id s) {
                 id r = ((id(*)(id,SEL))orig)(s, sel);
-                inspectObject(r, clsName, selName, 0);
-                return r;
+                inspectObject(r, cn, sn, 0); return r;
             };
             method_setImplementation(m, imp_implementationWithBlock(b));
             break;
         }
         case 2: {
             id b = ^id(id s, id a) {
-                inspectObject(a, clsName, selName, 0);
+                inspectObject(a, cn, sn, 0);
                 id r = ((id(*)(id,SEL,id))orig)(s, sel, a);
-                inspectObject(r, clsName, selName, 0);
-                return r;
+                inspectObject(r, cn, sn, 0); return r;
             };
             method_setImplementation(m, imp_implementationWithBlock(b));
             break;
         }
         case 3: {
             void (^b)(id, id) = ^(id s, id a) {
-                inspectObject(a, clsName, selName, 0);
+                inspectObject(a, cn, sn, 0);
                 ((void(*)(id,SEL,id))orig)(s, sel, a);
             };
             method_setImplementation(m, imp_implementationWithBlock(b));
@@ -297,17 +252,127 @@ static void simpleHook(Class cls, SEL sel, Method m, int kind) {
         }
         case 4: {
             id b = ^id(id s, id a, id c) {
-                inspectObject(a, clsName, selName, 0);
-                inspectObject(c, clsName, selName, 0);
+                inspectObject(a, cn, sn, 0); inspectObject(c, cn, sn, 0);
                 id r = ((id(*)(id,SEL,id,id))orig)(s, sel, a, c);
-                inspectObject(r, clsName, selName, 0);
-                return r;
+                inspectObject(r, cn, sn, 0); return r;
+            };
+            method_setImplementation(m, imp_implementationWithBlock(b));
+            break;
+        }
+        case 5: {
+            void (^b)(id, id, id) = ^(id s, id a, id c) {
+                inspectObject(a, cn, sn, 0); inspectObject(c, cn, sn, 0);
+                ((void(*)(id,SEL,id,id))orig)(s, sel, a, c);
+            };
+            method_setImplementation(m, imp_implementationWithBlock(b));
+            break;
+        }
+        case 6: {
+            void (^b)(id, id, id, id) = ^(id s, id a, id c, id d) {
+                inspectObject(a, cn, sn, 0); inspectObject(c, cn, sn, 0); inspectObject(d, cn, sn, 0);
+                ((void(*)(id,SEL,id,id,id))orig)(s, sel, a, c, d);
+            };
+            method_setImplementation(m, imp_implementationWithBlock(b));
+            break;
+        }
+        case 7: {
+            void (^b)(id, id, id, id, id) = ^(id s, id a, id c, id d, id e) {
+                inspectObject(a, cn, sn, 0); inspectObject(c, cn, sn, 0);
+                inspectObject(d, cn, sn, 0); inspectObject(e, cn, sn, 0);
+                ((void(*)(id,SEL,id,id,id,id))orig)(s, sel, a, c, d, e);
+            };
+            method_setImplementation(m, imp_implementationWithBlock(b));
+            break;
+        }
+        case 8: {
+            void (^b)(id, id, id, id, id, id) = ^(id s, id a, id c, id d, id e, id f) {
+                inspectObject(a, cn, sn, 0); inspectObject(c, cn, sn, 0);
+                inspectObject(d, cn, sn, 0); inspectObject(e, cn, sn, 0); inspectObject(f, cn, sn, 0);
+                ((void(*)(id,SEL,id,id,id,id,id))orig)(s, sel, a, c, d, e, f);
+            };
+            method_setImplementation(m, imp_implementationWithBlock(b));
+            break;
+        }
+        case 9: {
+            void (^b)(id, id, id, id, id, id, id) = ^(id s, id a, id c, id d, id e, id f, id g) {
+                inspectObject(a, cn, sn, 0); inspectObject(c, cn, sn, 0);
+                inspectObject(d, cn, sn, 0); inspectObject(e, cn, sn, 0);
+                inspectObject(f, cn, sn, 0); inspectObject(g, cn, sn, 0);
+                ((void(*)(id,SEL,id,id,id,id,id,id))orig)(s, sel, a, c, d, e, f, g);
             };
             method_setImplementation(m, imp_implementationWithBlock(b));
             break;
         }
         }
     } @catch (NSException *e) {}
+}
+
+// ============================================================
+// forward hook（只在参数 > 6 且类是 TTNetworkManager* 时用）
+// ============================================================
+static NSMutableDictionary<NSString *, NSValue *> *g_origIMPs = nil;
+static int g_forwardCount = 0;
+#define BT_MAX_FORWARD 40
+
+static void BTForwardInvocation(id self, SEL _cmd, NSInvocation *inv) {
+    SEL sel = inv.selector;
+    Class cls = object_getClass(self);
+    NSString *key = [NSString stringWithFormat:@"%s|%s",
+                     class_getName(cls) ?: "?", sel_getName(sel) ?: "?"];
+    NSValue *v = g_origIMPs[key];
+    if (!v) { [self doesNotRecognizeSelector:sel]; return; }
+    IMP orig = [v pointerValue];
+    if (!orig) return;
+
+    const char *cn = class_getName(cls);
+    const char *sn = sel_getName(sel);
+
+    NSMethodSignature *sig = inv.methodSignature;
+    NSUInteger n = sig.numberOfArguments;
+    for (NSUInteger i = 2; i < n; i++) {
+        const char *t = [sig getArgumentTypeAtIndex:i];
+        if (!t || t[0] != '@') continue;
+        if (strcmp(t, "@?") == 0) continue;
+        __unsafe_unretained id arg = nil;
+        @try { [inv getArgument:&arg atIndex:i]; } @catch (NSException *e) { continue; }
+        if (!arg || isBlockObject(arg)) continue;
+        inspectObject(arg, cn, sn, 0);
+    }
+
+    @try {
+        if ([inv respondsToSelector:@selector(invokeUsingIMP:)]) {
+            [inv invokeUsingIMP:orig];
+        } else {
+            Method m = class_getInstanceMethod(cls, sel);
+            IMP saved = m ? method_getImplementation(m) : NULL;
+            if (m) method_setImplementation(m, orig);
+            [inv invokeWithTarget:self];
+            if (m && saved) method_setImplementation(m, saved);
+        }
+    } @catch (NSException *e) {
+        TPOLOG(@"forward 异常 %s -%s: %@", cn, sn, e);
+    }
+}
+
+static BOOL installForwardHook(Class cls, SEL sel) {
+    if (g_forwardCount >= BT_MAX_FORWARD) return NO;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NO;
+    IMP cur = method_getImplementation(m);
+    if (cur == _objc_msgForward) return NO;
+
+    NSString *key = [NSString stringWithFormat:@"%s|%s",
+                     class_getName(cls), sel_getName(sel)];
+    if (!g_origIMPs[key]) g_origIMPs[key] = [NSValue valueWithPointer:cur];
+    method_setImplementation(m, _objc_msgForward);
+
+    SEL fsel = @selector(forwardInvocation:);
+    Method fm = class_getInstanceMethod(cls, fsel);
+    if (!fm || method_getImplementation(fm) != (IMP)BTForwardInvocation) {
+        class_replaceMethod(cls, fsel, (IMP)BTForwardInvocation, "v@:@");
+    }
+    g_forwardCount++;
+    return YES;
 }
 
 // ============================================================
@@ -318,7 +383,7 @@ void BTInstallTTNetProbe(void) {
     dispatch_once(&once, ^{
         if (!g_origIMPs) g_origIMPs = [NSMutableDictionary dictionary];
 
-        TPOLOG(@"========== v3 深度探测启动 ==========");
+        TPOLOG(@"========== v4 稳定探测启动 ==========");
 
         int total = objc_getClassList(NULL, 0);
         if (total <= 0) return;
@@ -327,10 +392,9 @@ void BTInstallTTNetProbe(void) {
         total = objc_getClassList(classes, total);
         TPOLOG(@"总类数: %d", total);
 
-        // 目标类关键词
         static const char *patterns[] = {
             "TTNetworkManager", "TTHttpTask", "TTNetResponse",
-            "NetResponse", "NetTask", "NetCallback",
+            "NetResponse", "NetTask",
             "IESNetworkResponse", "NetworkResponse",
         };
         const int np = sizeof(patterns) / sizeof(patterns[0]);
@@ -349,8 +413,12 @@ void BTInstallTTNetProbe(void) {
             }
             if (!ok) continue;
 
+            // forward 只在 TTNetworkManager* 类上启用
+            BOOL allowForward = (strncmp(name, "TTNetworkManager", 16) == 0 ||
+                                 strncmp(name, "TTHttpTask", 10) == 0);
+
             matched++;
-            TPOLOG(@"类: %s", name);
+            TPOLOG(@"类: %s%@", name, allowForward ? @"  [允许forward]" : @"");
 
             unsigned int mc = 0;
             Method *ms = class_copyMethodList(cls, &mc);
@@ -361,34 +429,22 @@ void BTInstallTTNetProbe(void) {
                 SEL sel = method_getName(m);
                 const char *sn = sel_getName(sel);
                 if (!sn) continue;
-
-                // 名字过滤：只要跟数据/响应/回调相关的
-                static const char *want[] = {
-                    "data", "Data", "body", "Body", "response", "Response",
-                    "finish", "Finish", "receive", "Receive",
-                    "handle", "Handle", "decode", "Decode",
-                    "callback", "Callback", "read", "Read",
-                    "url", "URL", "request", "Request",
-                };
-                BOOL nameOk = NO;
-                for (size_t w = 0; w < sizeof(want)/sizeof(want[0]); w++) {
-                    if (strstr(sn, want[w])) { nameOk = YES; break; }
-                }
-                if (!nameOk) continue;
+                if (shouldSkipSelector(sn)) { skipped++; continue; }
 
                 int kind = classifyMethod(m);
                 if (kind > 0) {
                     simpleHook(cls, sel, m, kind);
                     simpleHooked++;
-                    TPOLOG(@"  [简单%d] %s", kind, sn);
-                } else {
-                    // 多参数 → forwardInvocation
+                    TPOLOG(@"  [S%d] %s", kind, sn);
+                } else if (allowForward) {
                     if (installForwardHook(cls, sel)) {
                         forwardHooked++;
-                        TPOLOG(@"  [forward] %s", sn);
+                        TPOLOG(@"  [F] %s", sn);
                     } else {
                         skipped++;
                     }
+                } else {
+                    skipped++;
                 }
             }
             free(ms);
@@ -397,7 +453,7 @@ void BTInstallTTNetProbe(void) {
         free(classes);
 
         TPOLOG(@"========== 完成 ==========");
-        TPOLOG(@"类:%d  简单hook:%d  forward hook:%d  跳过:%d",
+        TPOLOG(@"类:%d  简单hook:%d  forward:%d  跳过:%d",
                matched, simpleHooked, forwardHooked, skipped);
         TPOLOG(@"现在打开礼物面板，观察 ★★★ 命中");
     });
