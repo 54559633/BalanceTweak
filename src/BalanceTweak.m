@@ -533,9 +533,11 @@ static NSData *btPatchWalletInfo(NSData *data) {
     if (!w) return;
 
     for (UIGestureRecognizer *g in w.gestureRecognizers) {
-        if ([g isKindOfClass:[UILongPressGestureRecognizer class]] &&
-            g.numberOfTouchesRequired == 3) {
-            return;
+        if ([g isKindOfClass:[UILongPressGestureRecognizer class]]) {
+            UILongPressGestureRecognizer *lp0 = (UILongPressGestureRecognizer *)g;
+            if (lp0.numberOfTouchesRequired == 3) {
+                return;
+            }
         }
     }
 
