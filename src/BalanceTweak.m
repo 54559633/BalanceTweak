@@ -761,6 +761,7 @@ static BOOL btParseDisplayInput(NSString *raw, int64_t *outVal) {
 
     NSArray<NSDictionary *> *items = @[
         @{@"title": @"对齐基准（保持当前显示值，清零累计变化）", @"tag": @1, @"destructive": @NO},
+        @{@"title": @"查看机器码（后台绑定用）", @"tag": @4, @"destructive": @NO},
         @{@"title": @"查看运行日志", @"tag": @3, @"destructive": @NO},
         @{@"title": @"重置全部配置", @"tag": @2, @"destructive": @YES},
     ];
@@ -930,7 +931,85 @@ static BOOL btParseDisplayInput(NSString *raw, int64_t *outVal) {
     } else if (sender.tag == 3) {
         BTLogVC *vc = [[BTLogVC alloc] init];
         [self.navigationController pushViewController:vc animated:YES];
+    } else if (sender.tag == 4) {
+        [self showMachineCode];
     }
+}
+
+// ============================================================
+// 机器码（后台绑定用）
+// ============================================================
+- (void)showMachineCode {
+    char *rawId = jjv_device_id();
+    NSString *deviceId = rawId ? [NSString stringWithUTF8String:rawId] : nil;
+    if (rawId) jjv_free(rawId);
+
+    BOOL authorized = jjv_is_authorized() ? YES : NO;
+
+    NSString *display = deviceId.length > 0 ? deviceId : @"(设备身份未就绪，请先触发一次网络请求)";
+
+    // 详情 JSON（含 device_prefix / protocol / build）
+    char *rawInfo = jjv_device_info_json();
+    NSString *infoJSON = rawInfo ? [NSString stringWithUTF8String:rawInfo] : @"{}";
+    if (rawInfo) jjv_free(rawInfo);
+
+    // 美化 JSON
+    NSData *jd = [infoJSON dataUsingEncoding:NSUTF8StringEncoding];
+    if (jd) {
+        id obj = [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil];
+        if (obj) {
+            NSData *pretty = [NSJSONSerialization dataWithJSONObject:obj
+                                                             options:NSJSONWritingPrettyPrinted
+                                                               error:nil];
+            if (pretty) {
+                infoJSON = [[NSString alloc] initWithData:pretty encoding:NSUTF8StringEncoding] ?: infoJSON;
+            }
+        }
+    }
+
+    NSString *title = [NSString stringWithFormat:@"机器码（%@）",
+                       authorized ? @"已授权" : @"未授权"];
+
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title
+                                                              message:display
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+
+    // 复制纯机器码
+    if (deviceId.length > 0) {
+        [a addAction:[UIAlertAction actionWithTitle:@"复制机器码"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *act) {
+            [UIPasteboard generalPasteboard].string = deviceId;
+            [self toast:@"机器码已复制到剪贴板"];
+        }]];
+    }
+
+    // 复制完整 JSON
+    [a addAction:[UIAlertAction actionWithTitle:@"复制完整信息(JSON)"
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *act) {
+        [UIPasteboard generalPasteboard].string = infoJSON;
+        [self toast:@"完整信息已复制"];
+    }]];
+
+    // 查看完整 JSON
+    [a addAction:[UIAlertAction actionWithTitle:@"查看完整信息"
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *act) {
+        UIAlertController *b = [UIAlertController alertControllerWithTitle:@"设备信息"
+                                                                   message:infoJSON
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [b addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *x) {
+            [UIPasteboard generalPasteboard].string = infoJSON;
+        }]];
+        [b addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:b animated:YES completion:nil];
+    }]];
+
+    [a addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)toast:(NSString *)msg {

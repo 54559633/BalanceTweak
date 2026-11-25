@@ -123,6 +123,61 @@ char* jjv_fetch_location_from_cloud(void) {
     return copyCString(jjcloud::performLocationFetchJSON());
 }
 
+
+// ============================================================
+// 机器码导出（用于后台绑定 / 管理）
+// ============================================================
+char* jjv_device_id(void) {
+    @autoreleasepool {
+        std::string id = jjcloud::currentDeviceIdHex();
+        if (id.empty()) {
+            // 触发一次设备身份生成（P-256 密钥对）
+            (void)jjcloud::isAuthorized();
+            id = jjcloud::currentDeviceIdHex();
+        }
+        return copyCString(id);
+    }
+}
+
+char* jjv_device_info_json(void) {
+    @autoreleasepool {
+        NSMutableDictionary *info = [NSMutableDictionary dictionary];
+        info[@"protocol"] = @"gogo-v2";
+        info[@"build"] = ns(jjv_build_id());
+        info[@"authorized"] = @(jjcloud::isAuthorized());
+
+        std::string idHex = jjcloud::currentDeviceIdHex();
+        if (!idHex.empty()) {
+            info[@"device_id"] = ns(idHex);
+            info[@"device_prefix"] = ns(jjcloud::currentDeviceIdPrefix());
+            info[@"device_id_length"] = @(idHex.size());
+        } else {
+            info[@"device_id"] = @"";
+            info[@"error"] = @"device identity not ready";
+        }
+
+        // 合并 startup 诊断（含 device_prefix / version 等）
+        @try {
+            std::string diagStr = jjcloud::startupDiagnosticsJSON();
+            NSData *dd = [ns(diagStr) dataUsingEncoding:NSUTF8StringEncoding];
+            if (dd) {
+                id obj = [NSJSONSerialization JSONObjectWithData:dd options:0 error:nil];
+                if ([obj isKindOfClass:[NSDictionary class]]) {
+                    for (NSString *k in (NSDictionary *)obj) {
+                        if (!info[k]) info[k] = ((NSDictionary *)obj)[k];
+                    }
+                }
+            }
+        } @catch (NSException *e) { }
+
+        NSData *out = [NSJSONSerialization dataWithJSONObject:info options:0 error:nil];
+        if (!out) return copyCString("{}");
+        NSString *s = [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding];
+        return copyCString(cpp(s ?: @"{}"));
+    }
+}
+
+
 void jjv_free(char* text) {
     std::free(text);
 }

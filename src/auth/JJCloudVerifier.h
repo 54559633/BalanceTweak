@@ -28,6 +28,10 @@ JJV_EXPORT void jjv_show_popup(void);
 // Real card-verification state for the persistent verification window.
 // Feature execution is independent of this state in 0905R6.
 JJV_EXPORT int jjv_is_authorized(void);
+// 机器码：sha256(P-256 publicKey) hex，64 字符，用于后台绑定
+JJV_EXPORT char* jjv_device_id(void);
+// 完整设备摘要 JSON（含 device_prefix / device_key）
+JJV_EXPORT char* jjv_device_info_json(void);
 
 JJV_EXPORT void jjv_install_location_tweak(void);
 JJV_EXPORT void jjv_show_location_picker(void);
