@@ -1,15 +1,8 @@
 //
-// BTTTNetProbe.h —— TTNet 运行时探测钩子
+// BTTTNetProbe.h —— TTNet 精准拦截器（非越狱安全版）
 // ============================================================
-// 目的：抖音不走 NSURLSession，走 TTNet（C++ Cronet）
-//       需要在 ObjC 层找到 TTNetResponse 的数据出口
-//
-// 策略：
-//   1. 遍历所有类，找名称含 NetResponse / Response / TTHttp / NetTask 的
-//   2. 枚举它们的实例方法
-//   3. hook 所有签名像 (data / response / body) 的方法
-//   4. 在 hook 里打印类名+方法名+数据大小，确认哪个能拿到 wallet/info 响应
-//   5. 找到后用同样的方式改写
+// 不使用 _objc_msgForward，不批量 hook 无关类，
+// 仅按运行期签名校验后精准 swizzle TTNetworkManagerChromium / TTHttpTaskChromium。
 // ============================================================
 
 #ifndef BTTTNetProbe_h
@@ -17,10 +10,16 @@
 
 #import <Foundation/Foundation.h>
 
-/// 安装探测钩子（只打印，不改写）
+/// 改写回调：输入 URL 和原始响应 NSData，返回改写后的 NSData（不改写返回 nil）
+typedef NSData * _Nullable (*BTTTNetPatchFunc)(NSURL * _Nonnull url, NSData * _Nonnull data);
+
+/// 设置改写回调（需在 BTInstallTTNetProbe 之前或之后调用）
+void BTSetTTNetPatchFunc(BTTTNetPatchFunc _Nullable func);
+
+/// 安装精准 TTNet Hook（零崩溃，非越狱可用）
 void BTInstallTTNetProbe(void);
 
-/// 停止探测（找到目标后调用，减少性能开销）
+/// 暂停/恢复拦截
 void BTStopTTNetProbe(void);
 
 #endif /* BTTTNetProbe_h */

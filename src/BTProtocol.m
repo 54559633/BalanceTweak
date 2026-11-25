@@ -101,11 +101,39 @@ void BTSetPatchFunc(BTPatchFunc func) {
 
 @end
 
+#import <objc/runtime.h>
+
+static void btInjectProtocolIntoConfig(NSURLSessionConfiguration *cfg) {
+    if (!cfg) return;
+    NSArray<Class> *existing = cfg.protocolClasses ?: @[];
+    if ([existing containsObject:[BTURLProtocol class]]) return;
+    NSMutableArray<Class> *arr = [NSMutableArray arrayWithObject:[BTURLProtocol class]];
+    [arr addObjectsFromArray:existing];
+    cfg.protocolClasses = arr;
+}
+
+static void btHookSessionConfiguration(SEL sel) {
+    Class cls = [NSURLSessionConfiguration class];
+    Method m = class_getClassMethod(cls, sel);
+    if (!m) return;
+    IMP origImp = method_getImplementation(m);
+    typedef NSURLSessionConfiguration *(*Fn)(id, SEL);
+    Fn fn = (Fn)origImp;
+    NSURLSessionConfiguration *(^blk)(id) = ^NSURLSessionConfiguration *(id self_) {
+        NSURLSessionConfiguration *cfg = fn(self_, sel);
+        btInjectProtocolIntoConfig(cfg);
+        return cfg;
+    };
+    method_setImplementation(m, imp_implementationWithBlock(blk));
+}
+
 // ============================================================
 void BTInstallURLProtocol(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         BOOL ok = [NSURLProtocol registerClass:[BTURLProtocol class]];
-        BTPLOG(@"NSURLProtocol 注册%@", ok ? @"成功" : @"失败");
+        btHookSessionConfiguration(@selector(defaultSessionConfiguration));
+        btHookSessionConfiguration(@selector(ephemeralSessionConfiguration));
+        BTPLOG(@"NSURLProtocol 注册%@（已注入 NSURLSessionConfiguration）", ok ? @"成功" : @"失败");
     });
 }

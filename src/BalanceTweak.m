@@ -426,8 +426,9 @@ static BOOL btParseDisplayInput(NSString *raw, int64_t *outVal) {
     } else if (sender.tag == 2) {
         [p reset];
         _tf.text = @"";
-        // 同时退出安全模式（用户主动重置 → 下次启动重新尝试 TTNetProbe）
+        // 同时退出安全模式（用户主动重置 → 下次启动重新尝试 TTNetHook）
         [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"BT_safemode"];
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"BT_safemode_v5"];
         [self refresh];
         [self toast:@"已重置。安全模式已关闭，重启 App 生效。"];
     } else if (sender.tag == 3) {
@@ -660,7 +661,7 @@ static void (^btWrapCompletion(void (^completion)(NSData *, NSURLResponse *, NSE
 // NSURLProtocol 改写回调（只处理 wallet/info）
 // ============================================================
 static NSData *btProtocolPatch(NSURL *url, NSData *data) {
-    if (!url || !data || data.length < 8) return nil;
+    if (!url || !data || data.length < 4) return nil;
 
     NSString *path = url.path ?: @"";
     if (![path containsString:@"/webcast/wallet/info/"]) return nil;
@@ -671,7 +672,7 @@ static NSData *btProtocolPatch(NSURL *url, NSData *data) {
     // 1. 读真实余额
     int64_t realVal = 0;
     if (!bt_read_wallet_real_balance(buf, len, &realVal)) {
-        BTLOG(@"[protocol] 读真实余额失败 (%luB)", (unsigned long)len);
+        BTLOG(@"[patch] 读真实余额失败 (%luB)", (unsigned long)len);
         return nil;
     }
 
@@ -683,7 +684,7 @@ static NSData *btProtocolPatch(NSURL *url, NSData *data) {
                             shouldPatch:&shouldPatch];
 
     if (!shouldPatch) {
-        BTLOG(@"[protocol] 真实=%lld 不改写（未启用或未设置）", realVal);
+        BTLOG(@"[patch] 真实=%lld 不改写（未启用或未设置）", realVal);
         return nil;
     }
 
@@ -691,14 +692,13 @@ static NSData *btProtocolPatch(NSURL *url, NSData *data) {
     uint8_t *outBuf = NULL;
     size_t outLen = 0;
     if (!bt_patch_wallet_info_buf(buf, len, display, &outBuf, &outLen)) {
-        BTLOG(@"[protocol] protobuf 改写失败");
+        BTLOG(@"[patch] protobuf 改写失败");
         return nil;
     }
 
-    NSData *result = [NSData dataWithBytes:outBuf length:outLen];
-    free(outBuf);
+    NSData *result = [NSData dataWithBytesNoCopy:outBuf length:outLen freeWhenDone:YES];
 
-    BTLOG(@"[protocol] 真实=%lld 显示=%lld  %luB -> %luB",
+    BTLOG(@"[patch] 真实=%lld 显示=%lld  %luB -> %luB",
           realVal, display, (unsigned long)len, (unsigned long)outLen);
 
     return result;
@@ -710,40 +710,36 @@ static NSData *btProtocolPatch(NSURL *url, NSData *data) {
 __attribute__((constructor))
 static void BTInit(void) {
     // ============================================================
-    // 崩溃自动降级保护
-    //   每次启动先写 flag，初始化完成后删 flag
-    //   若下次启动 flag 还在 → 上次崩了 → 启用安全模式（跳过 TTNetProbe）
+    // 崩溃自动降级保护（v5 独立 key，避免被旧版 v3 崩溃锁在安全模式）
     // ============================================================
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
                                                           NSUserDomainMask, YES) firstObject];
-    NSString *flag = [docs stringByAppendingPathComponent:@"BT_booting.flag"];
+    NSString *flag = [docs stringByAppendingPathComponent:@"BT_booting_v5.flag"];
     BOOL crashed = [[NSFileManager defaultManager] fileExistsAtPath:flag];
     if (crashed) {
-        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"BT_safemode"];
+        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"BT_safemode_v5"];
         [[NSFileManager defaultManager] removeItemAtPath:flag error:nil];
     }
     [[NSFileManager defaultManager] createFileAtPath:flag contents:[NSData data] attributes:nil];
 
-    BOOL safeMode = [[NSUserDefaults standardUserDefaults] boolForKey:@"BT_safemode"];
+    BOOL safeMode = [[NSUserDefaults standardUserDefaults] boolForKey:@"BT_safemode_v5"];
 
-    BTLOG(@"================ 加载 ================");
+    BTLOG(@"================ 加载 (v5) ================");
     if (crashed) BTLOG(@"⚠ 检测到上次崩溃 → 已进入安全模式");
-    BTLOG(@"安全模式: %@  flag=%@", safeMode ? @"开" : @"关", flag);
+    BTLOG(@"安全模式: %@", safeMode ? @"开" : @"关");
     BTLOG(@"三指长按 1 秒 → 打开设置");
 
-    // ★ 方案 A：NSURLProtocol 拦截（最稳，覆盖所有 NSURLSession 请求）
+    // ★ 方案 A：NSURLProtocol 拦截（已注入 NSURLSessionConfiguration）
     BTInstallURLProtocol();
     BTSetPatchFunc(btProtocolPatch);
 
-    // ★ 方案 C：TTNet 探测（安全模式下跳过）
+    // ★ 方案 C：TTNet 精准 Hook（主力：拦截 TTNetworkManagerChromium / TTHttpTaskChromium）
+    BTSetTTNetPatchFunc(btProtocolPatch);
     if (!safeMode) {
         BTInstallTTNetProbe();
     } else {
-        BTLOG(@"安全模式：跳过 TTNetProbe（可在设置界面点「重置」恢复）");
+        BTLOG(@"安全模式：跳过 TTNetHook（可在设置界面点「重置」恢复）");
     }
-
-    // ★ 方案 D：SSL_read 底层 hook（BoringSSL）
-    // BTInstallSSLHook();  // 未越狱禁用（fishhook 改 GOT 触发 AMFI 崩溃）
 
     // ★ 方案 B：NSURLSession completion hook（兜底）
     [BTNet install];
