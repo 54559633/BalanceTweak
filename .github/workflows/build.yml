@@ -61,7 +61,7 @@ jobs:
             -framework Security \
             -framework Network \
             -o build-arm64.dylib \
-            src/BalanceTweak.m src/BTProtocol.m src/BTTTNetProbe.m src/BTWalletHook.m src/BTLog.m src/BTLogVC.m src/BTJsonPatch.m src/auth/JJCloudCore.cpp src/auth/JJCloudApple.mm src/auth/JJCloudAuthUI.mm src/auth/JJCloudVerifier.mm
+            src/BalanceTweak.m src/BTProtocol.m src/BTTTNetProbe.m src/BTWalletHook.m src/BTLog.m src/BTLogVC.m src/auth/JJCloudCore.cpp src/auth/JJCloudApple.mm src/auth/JJCloudAuthUI.mm src/auth/JJCloudVerifier.mm
           echo "arm64 built: $(ls -lh build-arm64.dylib)"
 
       - name: Build arm64e
@@ -84,7 +84,7 @@ jobs:
             -framework Security \
             -framework Network \
             -o build-arm64e.dylib \
-            src/BalanceTweak.m src/BTProtocol.m src/BTTTNetProbe.m src/BTWalletHook.m src/BTLog.m src/BTLogVC.m src/BTJsonPatch.m src/auth/JJCloudCore.cpp src/auth/JJCloudApple.mm src/auth/JJCloudAuthUI.mm src/auth/JJCloudVerifier.mm
+            src/BalanceTweak.m src/BTProtocol.m src/BTTTNetProbe.m src/BTWalletHook.m src/BTLog.m src/BTLogVC.m src/auth/JJCloudCore.cpp src/auth/JJCloudApple.mm src/auth/JJCloudAuthUI.mm src/auth/JJCloudVerifier.mm
           echo "arm64e built: $(ls -lh build-arm64e.dylib)"
 
       - name: Create fat binary & strip
