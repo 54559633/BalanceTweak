@@ -15,18 +15,20 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq clang lld llvm python3-pip
+          sudo apt-get install -y -qq clang lld llvm libplist-dev pkg-config make git
           echo "=== versions ==="
           clang --version | head -2
-          ld64.lld --version || echo "no ld64.lld"
-          ls -la /usr/lib/llvm-*/bin/ld64.lld 2>/dev/null || true
+          ld64.lld --version || ls -la /usr/lib/llvm-*/bin/ld64.lld
 
       - name: Install ldid
+        continue-on-error: true
         run: |
-          pip3 install --break-system-packages ldid 2>/dev/null || \
-          (git clone --depth 1 https://github.com/ProcursusTeam/ldid.git && \
-           cd ldid && git submodule update --init && make -j4 && sudo cp ldid /usr/local/bin/)
-          which ldid || echo "ldid not available"
+          git clone --depth 1 https://github.com/ProcursusTeam/ldid.git /tmp/ldid
+          cd /tmp/ldid
+          git submodule update --init
+          make -j4
+          sudo cp ldid /usr/local/bin/ 2>/dev/null || sudo cp ./ldid /usr/local/bin/
+          which ldid && ldid -h | head -2 || echo "ldid unavailable (TrollFools will sign on device)"
 
       - name: Download iOS SDK 16.5
         run: |
