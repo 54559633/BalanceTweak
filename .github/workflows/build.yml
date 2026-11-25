@@ -63,7 +63,8 @@ jobs:
             -framework UIKit \
             -framework Foundation \
             -framework Security \
-            -framework Network \`n            -framework CoreGraphics \
+            -framework Network \
+            -framework CoreGraphics \
             -o build-arm64.dylib \
             BalanceTweak.o BTProtocol.o BTTTNetProbe.o BTWalletHook.o BTLog.o BTLogVC.o JJCloudCore.o JJCloudApple.o JJCloudAuthUI.o JJCloudVerifier.o
           echo "arm64 built: $(ls -lh build-arm64.dylib)"
@@ -90,7 +91,8 @@ jobs:
             -framework UIKit \
             -framework Foundation \
             -framework Security \
-            -framework Network \`n            -framework CoreGraphics \
+            -framework Network \
+            -framework CoreGraphics \
             -o build-arm64e.dylib \
             BalanceTweak.o BTProtocol.o BTTTNetProbe.o BTWalletHook.o BTLog.o BTLogVC.o JJCloudCore.o JJCloudApple.o JJCloudAuthUI.o JJCloudVerifier.o
           echo "arm64e built: $(ls -lh build-arm64e.dylib)"
