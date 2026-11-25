@@ -116,8 +116,8 @@ static int rebind_section(const struct mach_header_64 *header,
             }
 
             indirect_symbol_bindings[i] = rebindings[j].replacement;
-            __builtin___clear_cache((char *)&indirect_symbol_bindings[i],
-                                     (char *)&indirect_symbol_bindings[i] + pointer_size);
+            // ARM64 指令缓存一致性由硬件保证，不需要 __builtin___clear_cache
+            // （该内置函数在 iOS 上会生成不存在的 ___clear_cache 符号）
 
             boundCounts[j]++;
             bound++;
