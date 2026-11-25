@@ -3,12 +3,12 @@
 // ============================================================
 #import "BTLog.h"
 #include <stdio.h>
-#include <pthread.h>
+#include <os/lock.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 static NSString *g_logPath = nil;
-static pthread_mutex_t g_logLock = PTHREAD_MUTEX_INITIALIZER;
+static os_unfair_lock g_logLock = OS_UNFAIR_LOCK_INIT;
 
 /// 尝试找可写的日志路径
 static NSString *bt_find_log_path(void) {
@@ -54,7 +54,7 @@ NSString *BTLogFilePath(void) {
 void BTLogWrite(NSString *msg) {
     if (!msg) return;
 
-    pthread_mutex_lock(&g_logLock);
+    os_unfair_lock_lock(&g_logLock);
 
     // 确保路径已初始化（注意：BTLogFilePath 内部会调 BTLogWrite，需要防递归）
     static BOOL initializing = NO;
@@ -73,13 +73,13 @@ void BTLogWrite(NSString *msg) {
         }
     }
 
-    pthread_mutex_unlock(&g_logLock);
+    os_unfair_lock_unlock(&g_logLock);
 }
 
 void BTLogClear(void) {
-    pthread_mutex_lock(&g_logLock);
+    os_unfair_lock_lock(&g_logLock);
     if (g_logPath) {
         [[NSFileManager defaultManager] removeItemAtPath:g_logPath error:nil];
     }
-    pthread_mutex_unlock(&g_logLock);
+    os_unfair_lock_unlock(&g_logLock);
 }

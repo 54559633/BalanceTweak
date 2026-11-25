@@ -27,6 +27,7 @@
 #import "BTProtocol.h"
 #import "BTTTNetProbe.h"
 #import "BTLogVC.h"
+#import "BTSSLHook.h"
 
 // ============================================================
 // 日志与通知
@@ -714,6 +715,9 @@ static void BTInit(void) {
 
     // ★ 方案 C：TTNet 探测（抖音不走 NSURLSession 时）
     // BTInstallTTNetProbe();  // 暂时禁用（会导致闪退）
+
+    // ★ 方案 D：SSL_read 底层 hook（BoringSSL）
+    BTInstallSSLHook();
 
     // ★ 方案 B：NSURLSession completion hook（兜底）
     [BTNet install];
