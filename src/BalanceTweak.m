@@ -1124,6 +1124,17 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
 
     BTLOG(@"三指长按触发");
 
+    // ★★★ 卡密硬门禁：未授权 → 不呼出界面，只记日志 ★★★
+    if (!jjv_is_authorized()) {
+        BTLOG(@"⛔ [GATE] 未授权 → 拒绝呼出设置界面（只记录日志）");
+        // 记录一次拒绝，便于后台排查
+        char *idRaw = jjv_device_id();
+        NSString *dev = idRaw ? [NSString stringWithUTF8String:idRaw] : nil;
+        if (idRaw) jjv_free(idRaw);
+        BTLOG(@"⛔ [GATE] 设备机器码: %@", dev.length > 0 ? dev : @"(未生成)");
+        return;
+    }
+
     UIWindow *w = [self keyWindow];
     UIViewController *root = w.rootViewController;
     if (!root) return;
