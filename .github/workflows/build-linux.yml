@@ -1,0 +1,111 @@
+name: Build Dylib (Ubuntu)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld llvm python3-pip
+          echo "=== versions ==="
+          clang --version | head -2
+          ld64.lld --version || echo "no ld64.lld"
+          ls -la /usr/lib/llvm-*/bin/ld64.lld 2>/dev/null || true
+
+      - name: Install ldid
+        run: |
+          pip3 install --break-system-packages ldid 2>/dev/null || \
+          (git clone --depth 1 https://github.com/ProcursusTeam/ldid.git && \
+           cd ldid && git submodule update --init && make -j4 && sudo cp ldid /usr/local/bin/)
+          which ldid || echo "ldid not available"
+
+      - name: Download iOS SDK 16.5
+        run: |
+          git clone --filter=blob:none --no-checkout --depth 1 https://github.com/theos/sdks.git sdks
+          cd sdks
+          git sparse-checkout init --cone
+          git sparse-checkout set iPhoneOS16.5.sdk
+          git checkout
+          du -sh iPhoneOS16.5.sdk
+
+      - name: Build arm64e
+        run: |
+          SDK=$PWD/sdks/iPhoneOS16.5.sdk
+          clang -dynamiclib -target arm64e-apple-ios14.0 \
+            -isysroot "$SDK" \
+            -fobjc-arc -O2 \
+            -fuse-ld=lld \
+            -Wl,-undefined,dynamic_lookup \
+            -Wl,-no_fixup_chains \
+            -o arm64e.dylib \
+            src/BalanceTweak.m 2>&1 | tee build-arm64e.log
+          ls -lh arm64e.dylib || (echo "=== FAILED ===" && tail -40 build-arm64e.log && exit 1)
+
+      - name: Build arm64
+        run: |
+          SDK=$PWD/sdks/iPhoneOS16.5.sdk
+          clang -dynamiclib -target arm64-apple-ios14.0 \
+            -isysroot "$SDK" \
+            -fobjc-arc -O2 \
+            -fuse-ld=lld \
+            -Wl,-undefined,dynamic_lookup \
+            -Wl,-no_fixup_chains \
+            -o arm64.dylib \
+            src/BalanceTweak.m 2>&1 | tee build-arm64.log
+          ls -lh arm64.dylib || (echo "=== FAILED ===" && tail -40 build-arm64.log && exit 1)
+
+      - name: Merge fat binary
+        run: |
+          python3 - <<'PYEOF'
+          import struct
+          from pathlib import Path
+          a = Path('arm64.dylib').read_bytes()
+          b = Path('arm64e.dylib').read_bytes()
+          FAT_MAGIC = 0xcafebabf
+          n = 2
+          align = 14
+          hdr = 8 + n * 32
+          def au(v, a): return (v + a - 1) // a * a
+          off1 = au(hdr, 1 << align)
+          off2 = au(off1 + len(a), 1 << align)
+          h = struct.pack('>II', FAT_MAGIC, n)
+          h += struct.pack('>IIQQII', 0x0100000c, 0x00000000, off1, len(a), align, 0)
+          h += struct.pack('>IIQQII', 0x0100000c, 0x80000002, off2, len(b), align, 0)
+          buf = bytearray()
+          buf += h
+          buf += b'\x00' * (off1 - len(buf))
+          buf += a
+          buf += b'\x00' * (off2 - len(buf))
+          buf += b
+          Path('BalanceTweak.dylib').write_bytes(bytes(buf))
+          print(f"OK: {len(buf)} bytes (arm64 {len(a)} + arm64e {len(b)})")
+          PYEOF
+          ls -lh BalanceTweak.dylib
+          file BalanceTweak.dylib || true
+
+      - name: Sign
+        run: |
+          if command -v ldid >/dev/null 2>&1; then
+            ldid -S BalanceTweak.dylib
+            echo "signed"
+          else
+            echo "ldid missing - TrollFools will sign on device"
+          fi
+          echo "=== verify ==="
+          xxd -l 64 BalanceTweak.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BalanceTweak-dylib-linux
+          path: BalanceTweak.dylib
+          retention-days: 30
