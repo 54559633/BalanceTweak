@@ -24,6 +24,7 @@
 
 #import "BTProto.h"
 #import "BTProtocol.h"
+#import "BTTTNetProbe.h"
 
 // ============================================================
 // 日志与通知
@@ -703,6 +704,9 @@ static void BTInit(void) {
     // ★ 方案 A：NSURLProtocol 拦截（最稳，覆盖所有 NSURLSession 请求）
     BTInstallURLProtocol();
     BTSetPatchFunc(btProtocolPatch);
+
+    // ★ 方案 C：TTNet 探测（抖音不走 NSURLSession 时）
+    BTInstallTTNetProbe();
 
     // ★ 方案 B：NSURLSession completion hook（兜底）
     [BTNet install];
