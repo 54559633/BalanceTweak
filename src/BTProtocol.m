@@ -30,11 +30,12 @@ void BTSetPatchFunc(BTPatchFunc func) {
         return NO;
     }
 
-    // ★ 精确过滤：只拦截 3 个余额相关接口，其他一概不碰
+    // ★ 精确过滤：只拦截余额相关接口，其他一概不碰
     NSString *path = request.URL.path ?: @"";
     if ([path containsString:@"/webcast/wallet/info/"] ||
         [path containsString:@"wallet_api/recharge_page"] ||
-        [path containsString:@"wallet/core/v1/homepage/index"]) {
+        [path containsString:@"wallet/core/v1/homepage/index"] ||
+        [path containsString:@"wallet/core/v1/portal/polling"]) {
         return YES;
     }
     return NO;

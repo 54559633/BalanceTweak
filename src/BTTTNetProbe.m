@@ -427,12 +427,59 @@ static void btHookCJPayBridgeResponse(void) {
 }
 
 // ============================================================
+// Hook 3: NSJSONSerialization +JSONObjectWithData:options:error:
+//   极速 memmem 过滤（仅命中含 "asset_virtual_item" 且含 "diamond" 的钱包首页 JSON），
+//   无论走 TTNet / QUIC / 磁盘缓存 / CJPay / BDXBridge 均能 100% 生效！
+// ============================================================
+static _Thread_local BOOL t_inJSONHook = NO;
+
+static void btHookJSONSerialization(void) {
+    Class cls = [NSJSONSerialization class];
+    SEL sel = @selector(JSONObjectWithData:options:error:);
+    Method m = class_getClassMethod(cls, sel);
+    if (!m) return;
+
+    IMP origImp = method_getImplementation(m);
+    typedef id (*Fn)(id, SEL, NSData *, NSJSONReadingOptions, NSError **);
+    Fn fn = (Fn)origImp;
+
+    id (^blk)(id, NSData *, NSJSONReadingOptions, NSError **) =
+        ^id(id self_, NSData *data, NSJSONReadingOptions opt, NSError **err) {
+        if (!t_inJSONHook && g_active && g_patchFunc && data && data.length >= 32) {
+            const void *bytes = data.bytes;
+            size_t len = (size_t)data.length;
+            if (memmem(bytes, len, "asset_virtual_item", 18) != NULL &&
+                memmem(bytes, len, "\"diamond\"", 9) != NULL) {
+                t_inJSONHook = YES;
+                NSData *patched = nil;
+                @try {
+                    NSURL *fakeURL = [NSURL URLWithString:@"https://webcast5-normal-lf.amemv.com/caijing/wallet/core/v1/homepage/index/"];
+                    patched = g_patchFunc(fakeURL, data);
+                } @catch (NSException *e) {
+                    TTHLOG(@"JSONSerialization patch 异常: %@", e);
+                }
+                t_inJSONHook = NO;
+
+                if (patched && patched.length > 0) {
+                    return fn(self_, sel, patched, opt, err);
+                }
+            }
+        }
+        return fn(self_, sel, data, opt, err);
+    };
+
+    method_setImplementation(m, imp_implementationWithBlock(blk));
+    TTHLOG(@"✓ 已 hook NSJSONSerialization +JSONObjectWithData:options:error:");
+}
+
+// ============================================================
 // 入口
 // ============================================================
 void BTInstallTTNetProbe(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         TTHLOG(@"========== 钱包首页 JSON/TTNet Hook 启动 ==========");
+        btHookJSONSerialization();
         btHookHandleResponsePreProcessing();
         btHookCJPayBridgeResponse();
         TTHLOG(@"========== 钱包首页 Hook 安装完成 ==========");
