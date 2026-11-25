@@ -26,6 +26,7 @@
 #import "BTLog.h"
 #import "BTProtocol.h"
 #import "BTTTNetProbe.h"
+#import "BTLogVC.h"
 
 // ============================================================
 // 日志与通知
@@ -330,8 +331,9 @@ static BOOL btParseDisplayInput(NSString *raw, int64_t *outVal) {
     UIButton *applyBtn = [self makeButtonWithTitle:@"应用（以当前真实余额为基准）" tag:0 destructive:NO];
     _toggleBtn = [self makeButtonWithTitle:@"" tag:1 destructive:NO];
     UIButton *resetBtn = [self makeButtonWithTitle:@"重置" tag:2 destructive:YES];
+    UIButton *logBtn = [self makeButtonWithTitle:@"查看日志" tag:3 destructive:NO];
 
-    NSArray<UIButton *> *btns = @[applyBtn, _toggleBtn, resetBtn];
+    NSArray<UIButton *> *btns = @[applyBtn, _toggleBtn, resetBtn, logBtn];
 
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
     NSMutableArray<NSLayoutConstraint *> *cs = [NSMutableArray array];
@@ -424,6 +426,10 @@ static BOOL btParseDisplayInput(NSString *raw, int64_t *outVal) {
         [p reset];
         _tf.text = @"";
         [self refresh];
+    } else if (sender.tag == 3) {
+        // 查看日志
+        BTLogVC *vc = [[BTLogVC alloc] init];
+        [self.navigationController pushViewController:vc animated:YES];
     }
 }
 
