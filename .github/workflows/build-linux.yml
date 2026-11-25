@@ -46,6 +46,7 @@ jobs:
             -isysroot "$SDK" \
             -fobjc-arc -O2 \
             -fuse-ld=lld \
+            -Wl,-platform_version -Wl,ios -Wl,14.0 -Wl,16.5 \
             -Wl,-undefined,dynamic_lookup \
             -Wl,-no_fixup_chains \
             -o arm64e.dylib \
@@ -59,6 +60,7 @@ jobs:
             -isysroot "$SDK" \
             -fobjc-arc -O2 \
             -fuse-ld=lld \
+            -Wl,-platform_version -Wl,ios -Wl,14.0 -Wl,16.5 \
             -Wl,-undefined,dynamic_lookup \
             -Wl,-no_fixup_chains \
             -o arm64.dylib \
