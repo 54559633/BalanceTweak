@@ -72,31 +72,33 @@ static BOOL btWalletComputeGetterValue(const char *clsName, const char *selName,
 }
 
 // ============================================================
-// 类名过滤：仅锁定抖音钱包/钻石数据模型与管理器
+// 类名过滤：锁定钱包/钻石数据模型与管理器（排除系统框架与 UI/商品类）
 // ============================================================
+static BOOL btIsSystemPrefix(const char *name) {
+    static const char *sysPrefixes[] = {
+        "NS", "UI", "CA", "CF", "CG", "CI", "CL", "CN", "CT", "CV",
+        "PK", "WK", "MK", "MT", "AV", "CM", "SK", "SF", "BS", "FB",
+        "OS_", "_NS", "_UI", "_CA", "_CF", "_PK", "GEO", "IN", "HK",
+        "MP", "MS", "NE", "NW", "PH", "RL", "SC", "VN", "AX", "AC",
+        "AMS", "ASD", "DMF", "FMD", "IDS", "IM", "MC", "MN", "MTR",
+        "PassKit", "WalletUI", "FinanceKit", "StoreKit",
+    };
+    for (size_t i = 0; i < sizeof(sysPrefixes) / sizeof(sysPrefixes[0]); i++) {
+        if (strncmp(name, sysPrefixes[i], strlen(sysPrefixes[i])) == 0) return YES;
+    }
+    return NO;
+}
+
 static BOOL btIsTargetWalletClass(const char *name) {
     if (!name || !*name) return NO;
+    if (btIsSystemPrefix(name)) return NO;
 
-    // 1. 必须匹配抖音业务前缀
-    static const char *prefixes[] = {
-        "IESLive", "HTSLive", "AWELive", "AWEWallet", "AWEPay",
-        "CJPay", "IESWallet", "HTSWallet", "HTSAccount", "Wallet",
-    };
-    BOOL prefixOk = NO;
-    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
-        if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) {
-            prefixOk = YES;
-            break;
-        }
-    }
-    if (!prefixOk) return NO;
-
-    // 2. 必须包含核心关键词
-    if (!strstr(name, "Wallet") && !strstr(name, "Diamond") && !strstr(name, "Balance")) {
+    // 必须包含核心关键词
+    if (!strstr(name, "Wallet") && !strstr(name, "Diamond")) {
         return NO;
     }
 
-    // 3. 排除 UI / 商品 / 充值档位 / 礼物 / 订单 / 埋点 / 配置类（防止误改商品价格或档位）
+    // 排除 UI / 商品 / 充值档位 / 礼物 / 订单 / 埋点 / 配置类（防止误改商品价格或档位）
     static const char *excludes[] = {
         "ViewController", "Cell", "Button", "Label", "Image", "Icon",
         "Banner", "Popup", "Alert", "Dialog", "Sheet", "Layout", "Style",
@@ -108,17 +110,10 @@ static BOOL btIsTargetWalletClass(const char *name) {
         "RechargeOption", "IAP", "Receipt", "Record", "History", "Detail",
         "Transaction", "Bill", "Task", "Award", "Reward", "RedPacket",
         "Packet", "Lucky", "Lottery", "Activity", "Notice", "Tip", "Guide",
-        "Entrance", "Card", "Tab", "List", "Buy", "Pay",
+        "Entrance", "Card", "Tab", "List", "Buy",
     };
     for (size_t i = 0; i < sizeof(excludes) / sizeof(excludes[0]); i++) {
         if (strstr(name, excludes[i])) {
-            // 允许 CJPayWallet* 前缀中的 "Pay"，不误杀
-            if (strcmp(excludes[i], "Pay") == 0 && strncmp(name, "CJPay", 5) == 0 && !strstr(name + 5, "Pay")) {
-                continue;
-            }
-            if (strcmp(excludes[i], "Pay") == 0 && strncmp(name, "AWEPay", 6) == 0 && !strstr(name + 6, "Pay")) {
-                continue;
-            }
             return NO;
         }
     }
@@ -137,15 +132,21 @@ static BOOL btIsTargetWalletClass(const char *name) {
 static BOOL btIsBalanceGetter(const char *sn) {
     static const char *getters[] = {
         "diamond",
+        "diamonds",
         "diamondCount",
         "diamondCnt",
+        "diamond_cnt",
+        "diamond_count",
         "diamondNum",
         "diamondBalance",
+        "diamond_balance",
         "currentDiamond",
         "currentDiamondNum",
         "currentDiamondCount",
         "availableDiamond",
+        "availableDiamonds",
         "totalDiamond",
+        "totalDiamonds",
         "realDiamond",
         "balance",
         "walletBalance",
@@ -161,15 +162,21 @@ static BOOL btIsBalanceGetter(const char *sn) {
 static BOOL btIsBalanceSetter(const char *sn) {
     static const char *setters[] = {
         "setDiamond:",
+        "setDiamonds:",
         "setDiamondCount:",
         "setDiamondCnt:",
+        "setDiamond_cnt:",
+        "setDiamond_count:",
         "setDiamondNum:",
         "setDiamondBalance:",
+        "setDiamond_balance:",
         "setCurrentDiamond:",
         "setCurrentDiamondNum:",
         "setCurrentDiamondCount:",
         "setAvailableDiamond:",
+        "setAvailableDiamonds:",
         "setTotalDiamond:",
+        "setTotalDiamonds:",
         "setRealDiamond:",
         "setBalance:",
         "setWalletBalance:",
@@ -369,6 +376,7 @@ void BTInstallWalletModelHook(void) {
         int matchedClasses = 0;
         int hookedGetters = 0;
         int hookedSetters = 0;
+        int candidateLogged = 0;
 
         for (int i = 0; i < total; i++) {
             Class cls = classes[i];
@@ -381,6 +389,8 @@ void BTInstallWalletModelHook(void) {
             if (!methods) continue;
 
             BOOL classLogged = NO;
+            NSMutableArray<NSString *> *otherHits = nil;
+
             for (unsigned int k = 0; k < mc; k++) {
                 Method m = methods[k];
                 const char *sn = sel_getName(method_getName(m));
@@ -394,6 +404,12 @@ void BTInstallWalletModelHook(void) {
                 } else if (btIsBalanceSetter(sn)) {
                     hooked = btSwizzleSetter(cls, m, clsName, sn);
                     if (hooked) { hookedSetters++; kind = "SET"; }
+                } else if (candidateLogged < 20 &&
+                           (strcasestr(sn, "diamond") || strcasestr(sn, "balance"))) {
+                    if (!otherHits) otherHits = [NSMutableArray array];
+                    if (otherHits.count < 6) {
+                        [otherHits addObject:[NSString stringWithFormat:@"%s(%s)", sn, method_getTypeEncoding(m) ?: "?"]];
+                    }
                 }
 
                 if (hooked) {
@@ -405,11 +421,15 @@ void BTInstallWalletModelHook(void) {
                     WHLOG(@"  [%s] -%s (%s)", kind, sn, method_getTypeEncoding(m) ?: "?");
                 }
             }
+            if (!classLogged && otherHits.count > 0 && candidateLogged < 20) {
+                candidateLogged++;
+                WHLOG(@"[候选] %s: %@", clsName, [otherHits componentsJoinedByString:@", "]);
+            }
             free(methods);
         }
 
         free(classes);
-        WHLOG(@"========== 完成: 命中类 %d, getter %d, setter %d ==========",
-              matchedClasses, hookedGetters, hookedSetters);
+        WHLOG(@"========== 完成: 命中类 %d, getter %d, setter %d (候选 %d) ==========",
+              matchedClasses, hookedGetters, hookedSetters, candidateLogged);
     });
 }

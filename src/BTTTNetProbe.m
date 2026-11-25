@@ -144,7 +144,7 @@ static BOOL btVerifyObjectArgs(Method m, unsigned int expectedTotalArgs, char *o
 
     char ret[16] = {0};
     method_getReturnType(m, ret, sizeof(ret));
-    if (ret[0] != 'v' && ret[0] != '@') return NO;
+    if (ret[0] != 'v' && ret[0] != '@' && ret[0] != 'B' && ret[0] != 'c') return NO;
     if (outRetType) *outRetType = ret[0];
 
     for (unsigned int i = 2; i < argc; i++) {
@@ -155,9 +155,16 @@ static BOOL btVerifyObjectArgs(Method m, unsigned int expectedTotalArgs, char *o
     return YES;
 }
 
+static BOOL btIsWalletDebugURL(NSURL *url) {
+    if (!url) return NO;
+    NSString *s = (url.path.length > 0 ? url.path : (url.absoluteString ?: @"")).lowercaseString;
+    return ([s containsString:@"wallet"] || [s containsString:@"diamond"] || [s containsString:@"recharge"]);
+}
+
 // ============================================================
 // Hook 1: TTNetworkManagerChromium
 //   -handleResponsePreProcessing_:data:error:request:preprocessor:headerCallback:dataCallback:completedCallback:
+//   实测签名: B80@0:8@16@24@32@40@48@?56@?64@?72
 // ============================================================
 static void btHookHandleResponsePreProcessing(void) {
     Class cls = NSClassFromString(@"TTNetworkManagerChromium");
@@ -184,7 +191,28 @@ static void btHookHandleResponsePreProcessing(void) {
     }
 
     IMP origImp = method_getImplementation(m);
-    if (retType == 'v') {
+    static int dbgCount = 0;
+
+    if (retType == 'B' || retType == 'c') {
+        typedef BOOL (*Fn)(id, SEL, id, id, id, id, id, id, id, id);
+        Fn fn = (Fn)origImp;
+        BOOL (^blk)(id, id, id, id, id, id, id, id, id) =
+            ^BOOL(id self_, id resp, id data, id err, id req, id pre, id hdrCb, id dataCb, id compCb) {
+            id outData = data;
+            if (data && !err) {
+                NSURL *url = btExtractURL(req) ?: btExtractURL(resp);
+                if (btIsTargetWalletURL(url)) {
+                    outData = btMaybePatchData(url, data, req ?: resp, "PreProcessing");
+                } else if (dbgCount < 15 && btIsWalletDebugURL(url)) {
+                    dbgCount++;
+                    NSUInteger len = [data isKindOfClass:[NSData class]] ? ((NSData *)data).length : 0;
+                    TTHLOG(@"[观察] PreProcessing wallet相关: %@ (%luB)", url.path ?: url.absoluteString, (unsigned long)len);
+                }
+            }
+            return fn(self_, sel, resp, outData, err, req, pre, hdrCb, dataCb, compCb);
+        };
+        method_setImplementation(m, imp_implementationWithBlock(blk));
+    } else if (retType == 'v') {
         typedef void (*Fn)(id, SEL, id, id, id, id, id, id, id, id);
         Fn fn = (Fn)origImp;
         void (^blk)(id, id, id, id, id, id, id, id, id) =
@@ -215,7 +243,7 @@ static void btHookHandleResponsePreProcessing(void) {
         };
         method_setImplementation(m, imp_implementationWithBlock(blk));
     }
-    TTHLOG(@"✓ 已 hook TTNetworkManagerChromium -handleResponsePreProcessing_:");
+    TTHLOG(@"✓ 已 hook TTNetworkManagerChromium -handleResponsePreProcessing_: (ret=%c)", retType);
 }
 
 // ============================================================

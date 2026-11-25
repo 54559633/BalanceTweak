@@ -745,15 +745,7 @@ static void BTInit(void) {
     BTLOG(@"安全模式: %@", safeMode ? @"开" : @"关");
     BTLOG(@"三指长按 1 秒 → 打开设置");
 
-    // ★ 方案 2（主力）：直接 Swizzle 抖音钱包 Model / Manager 层（纯 ObjC，绕过网络库与 Protobuf）
-    BTSetWalletCallbacks(btWalletRecordReal, btWalletGetDisplay);
-    if (!safeMode) {
-        BTInstallWalletModelHook();
-    } else {
-        BTLOG(@"安全模式：跳过 WalletHook（可在设置界面点「重置」恢复）");
-    }
-
-    // ★ 方案 1（辅助）：TTNet 精准 Hook（拦截 TTNetworkManagerChromium / TTHttpTaskChromium）
+    // ★ 方案 1：TTNet 精准 Hook（立即安装，拦截 TTNetworkManagerChromium / TTHttpTaskChromium）
     BTSetTTNetPatchFunc(btProtocolPatch);
     if (!safeMode) {
         BTInstallTTNetProbe();
@@ -766,8 +758,14 @@ static void BTInit(void) {
     BTSetPatchFunc(btProtocolPatch);
     [BTNet install];
 
+    // ★ 方案 2（钱包 Model/Manager 层）：注册回调，待所有动态库/Swift模块加载完毕后（1.5s）安装
+    BTSetWalletCallbacks(btWalletRecordReal, btWalletGetDisplay);
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        if (!safeMode) {
+            BTInstallWalletModelHook();
+        }
         [BTGesture install];
         // 初始化完成 → 删 flag（表示这次没崩）
         [[NSFileManager defaultManager] removeItemAtPath:flag error:nil];
