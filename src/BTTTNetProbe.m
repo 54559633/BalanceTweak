@@ -2,10 +2,11 @@
 // BTTTNetProbe.m —— TTNet 运行时探测
 // ============================================================
 #import "BTTTNetProbe.h"
+#import "BTLog.h"
 #import <objc/runtime.h>
 #include <string.h>
 
-#define TPOLog(fmt, ...) NSLog(@"[TTNetProbe] " fmt, ##__VA_ARGS__)
+#define TPOLog(fmt, ...) BT_LOG_M(@"TTNetProbe", fmt, ##__VA_ARGS__)
 
 static BOOL g_probeActive = YES;
 

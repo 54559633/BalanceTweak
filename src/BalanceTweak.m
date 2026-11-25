@@ -23,13 +23,14 @@
 #include <stdlib.h>
 
 #import "BTProto.h"
+#import "BTLog.h"
 #import "BTProtocol.h"
 #import "BTTTNetProbe.h"
 
 // ============================================================
 // 日志与通知
 // ============================================================
-#define BTLOG(fmt, ...) NSLog(@"[BalanceTweak] " fmt, ##__VA_ARGS__)
+#define BTLOG(fmt, ...) BT_LOG_M(@"Main", fmt, ##__VA_ARGS__)
 
 static NSString *const BTBalanceDidUpdateNotification = @"BTBalanceDidUpdateNotification";
 

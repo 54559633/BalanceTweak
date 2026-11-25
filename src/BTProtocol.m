@@ -2,8 +2,9 @@
 // BTProtocol.m —— NSURLProtocol 拦截器实现（简化版）
 // ============================================================
 #import "BTProtocol.h"
+#import "BTLog.h"
 
-#define BTPLOG(fmt, ...) NSLog(@"[BTProtocol] " fmt, ##__VA_ARGS__)
+#define BTPLOG(fmt, ...) BT_LOG_M(@"BTProtocol", fmt, ##__VA_ARGS__)
 
 static BTPatchFunc g_patchFunc = NULL;
 
