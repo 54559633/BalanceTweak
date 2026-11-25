@@ -1,206 +1,218 @@
 //
-// BTTTNetProbe.m —— TTNet 运行时探测
+// BTTTNetProbe.m —— TTNet 安全探测（未越狱兼容）
+// ============================================================
+// 未越狱设备只允许 ObjC method swizzling，禁止改代码段
+//
+// 之前崩溃原因：
+//   imp_implementationWithBlock 的 block 签名与方法签名不匹配
+//   → 调用时栈帧错乱 → 崩
+//
+// 修复：
+//   1. 用 NSMethodSignature 严格解析方法签名
+//   2. 只 hook 签名确定的三种：
+//        (A) - (id)method             @16@0:8
+//        (B) - (id)method:(id)arg     @24@0:8@16
+//        (C) - (void)method:(id)arg   v24@0:8@16
+//   3. 其他签名一律跳过
 // ============================================================
 #import "BTTTNetProbe.h"
 #import "BTLog.h"
 #import <objc/runtime.h>
 #include <string.h>
 
-#define TPOLog(fmt, ...) BT_LOG_M(@"TTNetProbe", fmt, ##__VA_ARGS__)
+#define TPOLOG(fmt, ...) BT_LOG_M(@"TTNetProbe", fmt, ##__VA_ARGS__)
 
 static BOOL g_probeActive = YES;
 
 void BTStopTTNetProbe(void) {
     g_probeActive = NO;
-    TPOLog(@"探测已停止");
+    TPOLOG(@"探测已停止");
 }
 
 // ============================================================
-// 工具函数
+// 特征检测
 // ============================================================
+static const char *detectFeature(const void *data, size_t len) {
+    if (!data || len < 8) return NULL;
 
-/// 安全读 NSString from id
-static NSString *safeStr(id obj) {
-    if (!obj) return nil;
-    if ([obj isKindOfClass:[NSString class]]) return obj;
-    return nil;
-}
-
-/// 安全读 NSData from id
-static NSData *safeData(id obj) {
-    if (!obj) return nil;
-    if ([obj isKindOfClass:[NSData class]]) return obj;
-    return nil;
-}
-
-/// 从 NSData 里找 URL 特征
-static NSString *detectPathInData(NSData *data) {
-    if (!data || data.length < 16) return nil;
-
-    const uint8_t *bytes = data.bytes;
-    size_t len = data.length;
-
-    const char *patterns[] = {
+    static const char *patterns[] = {
         "wallet/info",
         "/webcast/wallet",
-        "recharge_page",
-        "wallet/core/v1",
+        "wallet_api/recharge_page",
+        "wallet/core/v1/homepage",
         "diamond_cnt",
     };
-    const int n = 5;
+    static const size_t plens[] = {11, 15, 24, 23, 11};
 
-    for (int i = 0; i < n; i++) {
-        const char *p = patterns[i];
-        size_t plen = strlen(p);
+    const uint8_t *p = (const uint8_t *)data;
+    for (int i = 0; i < 5; i++) {
+        const char *pat = patterns[i];
+        size_t plen = plens[i];
         if (len < plen) continue;
-
-        // 简单字节搜索
         for (size_t j = 0; j + plen <= len; j++) {
-            if (memcmp(bytes + j, p, plen) == 0) {
-                return [NSString stringWithUTF8String:p];
-            }
+            if (memcmp(p + j, pat, plen) == 0) return pat;
         }
     }
-    return nil;
+    return NULL;
 }
 
-/// 判断方法签名是否值得 hook
-static BOOL shouldHookMethod(Method m, const char *selName) {
-    if (!m || !selName) return NO;
+/// 从 id 对象里提取可检查的字节
+static void inspectObject(id obj, const char *clsName, const char *selName) {
+    if (!g_probeActive || !obj) return;
 
-    const char *name = selName;
-
-    // 排除明显无关的
-    const char *skip[] = {
-        "set", "init", "dealloc", "class", "description", "debug",
-        "hash", "isEqual", "copyWith", "shared", "default",
-        "count", "enumerate", "add", "remove", "insert", "replace",
-        "URL", "url", "header", "Header", "cookie", "Cookie",
-        "timing", "Timing", "stat", "Stat", "log", "Log",
-    };
-    for (int i = 0; i < 20; i++) { }  // placeholder
-    for (size_t i = 0; i < sizeof(skip) / sizeof(skip[0]); i++) {
-        if (strncmp(name, skip[i], strlen(skip[i])) == 0) return NO;
+    // NSData
+    if ([obj isKindOfClass:[NSData class]]) {
+        NSData *d = (NSData *)obj;
+        const char *hit = detectFeature(d.bytes, d.length);
+        if (hit) {
+            TPOLOG(@"★命中 NSData %s -%s  %luB  特征=\"%s\"",
+                   clsName, selName, (unsigned long)d.length, hit);
+            // hex dump 前 48 字节
+            NSMutableString *hex = [NSMutableString string];
+            NSUInteger n = MIN(d.length, 48);
+            const uint8_t *b = d.bytes;
+            for (NSUInteger i = 0; i < n; i++) [hex appendFormat:@"%02x", b[i]];
+            TPOLOG(@"   hex: %@", hex);
+        }
+        return;
     }
 
-    // 只要含这些词
-    const char *want[] = {
-        "data", "Data", "body", "Body",
-        "response", "Response",
-        "finish", "Finish",
-        "didReceive", "receive", "Receive",
-        "handle", "Handle",
-        "decode", "Decode",
-        "json", "Json", "JSON",
-        "protobuf", "Protobuf",
-        "prepare", "Prepare",
-    };
-    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
-        if (strstr(name, want[i])) return YES;
+    // NSString
+    if ([obj isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)obj;
+        NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+        const char *hit = detectFeature(d.bytes, d.length);
+        if (hit) {
+            TPOLOG(@"★命中 NSString %s -%s  特征=\"%s\"", clsName, selName, hit);
+        }
+        return;
     }
 
-    return NO;
+    // NSDictionary / NSArray / NSNumber → 转 JSON 检查
+    if ([obj isKindOfClass:[NSDictionary class]] ||
+        [obj isKindOfClass:[NSArray class]]) {
+        if (![NSJSONSerialization isValidJSONObject:obj]) return;
+        NSData *d = [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil];
+        if (!d) return;
+        const char *hit = detectFeature(d.bytes, d.length);
+        if (hit) {
+            TPOLOG(@"★命中 JSON %s -%s  %luB  特征=\"%s\"",
+                   clsName, selName, (unsigned long)d.length, hit);
+        }
+        return;
+    }
 }
 
 // ============================================================
-// 探测 hook
+// 安全 hook（严格签名）
 // ============================================================
 
-/// 对一个方法挂上探测钩子
-static void hookForProbe(Class cls, SEL sel, Method m, int idx) {
+/// 解析方法签名，返回类型代号：
+///   1 = @16@0:8      (id)method
+///   2 = @24@0:8@16   (id)method:(id)
+///   3 = v24@0:8@16   (void)method:(id)
+///   4 = @32@0:8@16@24 (id)method:(id):(id)
+///   0 = 不安全，跳过
+static int classifyMethod(Method m) {
+    if (!m) return 0;
+    const char *enc = method_getTypeEncoding(m);
+    if (!enc) return 0;
+
+    // 精确字符串匹配（最安全）
+    if (strcmp(enc, "@16@0:8") == 0) return 1;
+    if (strcmp(enc, "@24@0:8@16") == 0) return 2;
+    if (strcmp(enc, "v24@0:8@16") == 0) return 3;
+    if (strcmp(enc, "@32@0:8@16@24") == 0) return 4;
+
+    // 带引号/其他修饰的变体：用 NSMethodSignature 二次校验
+    @try {
+        NSMethodSignature *sig = [NSMethodSignature signatureWithObjCTypes:enc];
+        if (!sig) return 0;
+        NSUInteger n = sig.numberOfArguments;
+        const char *ret = sig.methodReturnType;
+
+        // 所有参数必须是 @ 或 :
+        for (NSUInteger i = 0; i < n; i++) {
+            const char *t = [sig getArgumentTypeAtIndex:i];
+            if (!t) return 0;
+            if (t[0] != '@' && t[0] != ':') return 0;
+        }
+
+        BOOL retIsId = (ret[0] == '@');
+        BOOL retIsVoid = (ret[0] == 'v');
+
+        if (n == 2 && retIsId) return 1;
+        if (n == 3 && retIsId) return 2;
+        if (n == 3 && retIsVoid) return 3;
+        if (n == 4 && retIsId) return 4;
+    } @catch (NSException *e) {
+        return 0;
+    }
+    return 0;
+}
+
+static int g_hookedCount = 0;
+static int g_skippedCount = 0;
+
+static void safeHook(Class cls, SEL sel, Method m, int kind) {
     const char *clsName = class_getName(cls);
     const char *selName = sel_getName(sel);
-
     IMP orig = method_getImplementation(m);
     if (!orig) return;
 
-    // 根据方法签名判断返回类型和参数
-    const char *typeEnc = method_getTypeEncoding(m);
-    if (!typeEnc) return;
-
-    // 只处理返回 id 或者参数里有 id 的方法
-    // typeEnc 形如: "@24@0:8@16" (返回 id, self, sel, 参数 id)
-    BOOL retIsId = (typeEnc[0] == '@');
-    if (!retIsId) return;
-
-    // 用 NSInvocation 的方式没法在 imp_implementationWithBlock 里用
-    // 简单方案：hook 返回 id 的无参/单参方法
-    const char *p = typeEnc;
-    int numArgs = 0;
-    while (*p) {
-        if (*p == ':') {
-            p++;
-            numArgs++;
-        } else {
-            p++;
+    @try {
+        switch (kind) {
+        case 1: {
+            // - (id)method
+            id block = ^id(id self_) {
+                id r = ((id (*)(id, SEL))orig)(self_, sel);
+                inspectObject(r, clsName, selName);
+                return r;
+            };
+            method_setImplementation(m, imp_implementationWithBlock(block));
+            break;
         }
-    }
-
-    // 只 hook 0-1 个额外参数的方法（self + sel + 0~1）
-    if (numArgs > 3) return;
-
-    static int hookCount = 0;
-    hookCount++;
-
-    // 用 Interceptor? 没有，用 method_setImplementation + 通用 trampoline
-    // 简化：用 objc_msgSend 转发的 block（需要匹配签名）
-
-    if (numArgs == 2) {
-        // - (id)method  (无参)
-        id block = ^id(id self_) {
-            id r = ((id (*)(id, SEL))orig)(self_, sel);
-            if (g_probeActive && r) {
-                NSData *d = safeData(r);
-                if (d && d.length > 20) {
-                    NSString *hit = detectPathInData(d);
-                    if (hit) {
-                        TPOLog(@"★命中 %s -%s  NSData %luB  特征=%@",
-                               clsName, selName, (unsigned long)d.length, hit);
-                    }
-                } else {
-                    NSString *s = safeStr(r);
-                    if (s) {
-                        NSData *sd = [s dataUsingEncoding:NSUTF8StringEncoding];
-                        NSString *hit = detectPathInData(sd);
-                        if (hit) {
-                            TPOLog(@"★命中 %s -%s  NSString 特征=%@", clsName, selName, hit);
-                        }
-                    }
-                }
-            }
-            return r;
-        };
-        method_setImplementation(m, imp_implementationWithBlock(block));
-
-    } else if (numArgs == 3) {
-        // - (id)method:(id)arg
-        id block = ^id(id self_, id arg) {
-            id r = ((id (*)(id, SEL, id))orig)(self_, sel, arg);
-            if (g_probeActive) {
-                // 检查参数
-                NSData *ad = safeData(arg);
-                if (ad && ad.length > 20) {
-                    NSString *hit = detectPathInData(ad);
-                    if (hit) {
-                        TPOLog(@"★命中(参数) %s -%s  NSData %luB  特征=%@",
-                               clsName, selName, (unsigned long)ad.length, hit);
-                    }
-                }
-                // 检查返回值
-                if (r) {
-                    NSData *d = safeData(r);
-                    if (d && d.length > 20) {
-                        NSString *hit = detectPathInData(d);
-                        if (hit) {
-                            TPOLog(@"★命中(返回) %s -%s  NSData %luB  特征=%@",
-                                   clsName, selName, (unsigned long)d.length, hit);
-                        }
-                    }
-                }
-            }
-            return r;
-        };
-        method_setImplementation(m, imp_implementationWithBlock(block));
+        case 2: {
+            // - (id)method:(id)arg
+            id block = ^id(id self_, id arg) {
+                inspectObject(arg, clsName, selName);
+                id r = ((id (*)(id, SEL, id))orig)(self_, sel, arg);
+                inspectObject(r, clsName, selName);
+                return r;
+            };
+            method_setImplementation(m, imp_implementationWithBlock(block));
+            break;
+        }
+        case 3: {
+            // - (void)method:(id)arg
+            void (^block)(id, id) = ^(id self_, id arg) {
+                inspectObject(arg, clsName, selName);
+                ((void (*)(id, SEL, id))orig)(self_, sel, arg);
+            };
+            method_setImplementation(m, imp_implementationWithBlock(block));
+            break;
+        }
+        case 4: {
+            // - (id)method:(id)a arg2:(id)b
+            id block = ^id(id self_, id a, id b) {
+                inspectObject(a, clsName, selName);
+                inspectObject(b, clsName, selName);
+                id r = ((id (*)(id, SEL, id, id))orig)(self_, sel, a, b);
+                inspectObject(r, clsName, selName);
+                return r;
+            };
+            method_setImplementation(m, imp_implementationWithBlock(block));
+            break;
+        }
+        default:
+            g_skippedCount++;
+            return;
+        }
+        g_hookedCount++;
+        TPOLOG(@"  hooked [%d] %s -%s", kind, clsName, selName);
+    } @catch (NSException *e) {
+        TPOLOG(@"  hook 异常 %s -%s: %@", clsName, selName, e);
+        g_skippedCount++;
     }
 }
 
@@ -210,29 +222,29 @@ static void hookForProbe(Class cls, SEL sel, Method m, int idx) {
 void BTInstallTTNetProbe(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        TPOLog(@"开始探测 TTNet 相关类...");
+        TPOLOG(@"开始探测（安全模式，严格签名）");
 
         int numClasses = objc_getClassList(NULL, 0);
         if (numClasses <= 0) {
-            TPOLog(@"objc_getClassList 返回 %d", numClasses);
+            TPOLOG(@"objc_getClassList 失败: %d", numClasses);
             return;
         }
 
         Class *classes = (Class *)malloc(sizeof(Class) * numClasses);
         if (!classes) return;
         numClasses = objc_getClassList(classes, numClasses);
+        TPOLOG(@"总类数: %d", numClasses);
 
         // 目标类名关键词
-        const char *clsPatterns[] = {
-            "NetResponse", "TTNetResponse", "NetTask", "TTHttpTask",
-            "NetRequest", "TTNetworkManager", "NetDispatcher",
-            "ResponseInfo", "ResponseModel", "NetworkResponse",
-            "TTNetCallback", "NetCallback", "CronetResponse",
+        static const char *clsPatterns[] = {
+            "NetResponse", "TTNetResponse", "NetTask",
+            "TTNetCallback", "NetCallback",
+            "NetDispatcher", "ResponseInfo",
+            "NetworkResponse", "TTHttpTask",
         };
         const int nPat = sizeof(clsPatterns) / sizeof(clsPatterns[0]);
 
         int matchedClasses = 0;
-        int hookedMethods = 0;
 
         for (int i = 0; i < numClasses; i++) {
             Class cls = classes[i];
@@ -242,41 +254,52 @@ void BTInstallTTNetProbe(void) {
 
             BOOL matched = NO;
             for (int j = 0; j < nPat; j++) {
-                if (strstr(name, clsPatterns[j])) {
-                    matched = YES;
-                    break;
-                }
+                if (strstr(name, clsPatterns[j])) { matched = YES; break; }
             }
             if (!matched) continue;
 
             matchedClasses++;
-            TPOLog(@"找到类: %s", name);
+            TPOLOG(@"类: %s", name);
 
-            // 枚举实例方法
+            // 实例方法
             unsigned int mCount = 0;
             Method *methods = class_copyMethodList(cls, &mCount);
-            if (!methods) continue;
+            if (methods) {
+                for (unsigned int k = 0; k < mCount; k++) {
+                    Method m = methods[k];
+                    SEL sel = method_getName(m);
+                    int kind = classifyMethod(m);
+                    if (kind == 0) { g_skippedCount++; continue; }
 
-            for (unsigned int k = 0; k < mCount; k++) {
-                Method m = methods[k];
-                SEL sel = method_getName(m);
-                const char *selName = sel_getName(sel);
-                if (!shouldHookMethod(m, selName)) continue;
+                    // 只 hook 名字相关的
+                    const char *selName = sel_getName(sel);
+                    static const char *want[] = {
+                        "data", "Data", "body", "Body",
+                        "response", "Response",
+                        "finish", "Finish", "receive", "Receive",
+                        "handle", "Handle", "decode", "Decode",
+                    };
+                    BOOL nameOk = NO;
+                    for (size_t w = 0; w < sizeof(want)/sizeof(want[0]); w++) {
+                        if (strstr(selName, want[w])) { nameOk = YES; break; }
+                    }
+                    if (!nameOk) continue;
 
-                @try {
-                    hookForProbe(cls, sel, m, (int)k);
-                    hookedMethods++;
-                    TPOLog(@"  hooked -%s", selName);
-                } @catch (NSException *e) {
-                    TPOLog(@"  hook -%s 异常: %@", selName, e);
+                    safeHook(cls, sel, m, kind);
                 }
+                free(methods);
             }
-            free(methods);
+
+            // 类方法
+            unsigned int cmCount = 0;
+            Method *cms = class_copyMethodList(object_getClass(cls), &cmCount);
+            if (cms) free(cms);
         }
 
         free(classes);
 
-        TPOLog(@"探测完成: %d 个类, %d 个方法", matchedClasses, hookedMethods);
-        TPOLog(@"现在去打开礼物面板，看日志里哪个 ★命中 出现了 wallet/info");
+        TPOLOG(@"完成: %d 个类, %d 个方法 hook, %d 个跳过",
+               matchedClasses, g_hookedCount, g_skippedCount);
+        TPOLOG(@"去打开礼物面板，看有没有 ★命中");
     });
 }

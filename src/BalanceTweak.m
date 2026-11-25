@@ -714,10 +714,10 @@ static void BTInit(void) {
     BTSetPatchFunc(btProtocolPatch);
 
     // ★ 方案 C：TTNet 探测（抖音不走 NSURLSession 时）
-    // BTInstallTTNetProbe();  // 暂时禁用（会导致闪退）
+    BTInstallTTNetProbe();
 
     // ★ 方案 D：SSL_read 底层 hook（BoringSSL）
-    BTInstallSSLHook();
+    // BTInstallSSLHook();  // 未越狱禁用（fishhook 改 GOT 触发 AMFI 崩溃）
 
     // ★ 方案 B：NSURLSession completion hook（兜底）
     [BTNet install];
