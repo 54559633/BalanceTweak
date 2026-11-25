@@ -47,11 +47,6 @@ NSString *BTLogFilePath(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         g_logPath = bt_find_log_path();
-        // 启动分隔线
-        NSString *header = [NSString stringWithFormat:
-            @"\n========== BalanceTweak 启动 %@ ==========\n",
-            [NSDate date]];
-        BTLogWrite(header);
     });
     return g_logPath;
 }

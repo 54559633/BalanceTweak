@@ -707,7 +707,7 @@ static void BTInit(void) {
     BTSetPatchFunc(btProtocolPatch);
 
     // ★ 方案 C：TTNet 探测（抖音不走 NSURLSession 时）
-    BTInstallTTNetProbe();
+    // BTInstallTTNetProbe();  // 暂时禁用（会导致闪退）
 
     // ★ 方案 B：NSURLSession completion hook（兜底）
     [BTNet install];
