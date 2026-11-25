@@ -1,11 +1,19 @@
 //
 // BTWalletHook.m —— 方案 2：直接 Swizzle 抖音钱包 Model / Manager 层
 // ============================================================
-// 纯 ObjC Runtime Swizzle，完全兼容非越狱设备，不依赖网络协议/Protobuf：
-//   1. 按严格白名单前缀 + 关键词筛选钱包/钻石数据类，排除 UI/商品/礼包/订单类
-//   2. 仅 Hook 精确匹配的余额属性 getter / setter，并做严格 ABI 类型校验
-//   3. setter 收到真实值 → 同步 BTPrefs（带防回声校验，避免被自身改写值污染）
-//   4. getter 读取时 → 开关开启返回 computedDisplay，开关关闭立即恢复真实值
+// 基于真机日志确认的精准类与方法：
+//   1. IESLiveWalletMyCoinModel:
+//        -diamondCntX10 (q16@0:8)          → 真实余额×10，读回真实值并改写返回 disp×10
+//        -setDiamondCntX10: (v24@0:8q16)   → 记录真实余额 v/10
+//        -diamondCntDisplayString (@16@0:8)→ 改写返回格式化后的 disp 字符串
+//   2. IESLiveWalletModel:
+//        -diamondNumDisplayString (@16@0:8)→ 改写返回格式化后的 disp 字符串
+//   3. 通用钱包/钻石类（排除 UI/商品/档位/订单类）的整数/double/NSNumber 余额属性
+//
+// 关键机制：
+//   - setter 原样写入真实值到 ivar，确保 ivar 永远保存真实余额
+//   - getter 读取 ivar 真实值时也会同步记录 lastReal（即使首次赋值发生在 hook 之前也能立即捕获！）
+//   - 开关打开时 getter 返回 computedDisplay，关闭开关立即还原真实余额
 // ============================================================
 
 #import "BTWalletHook.h"
@@ -29,16 +37,15 @@ void BTSetWalletCallbacks(BTWalletRecordRealFunc recordFunc,
 }
 
 // ============================================================
-// 真实余额记录（带回声防护：避免 Model A getter -> Model B setter 污染 lastReal）
+// 真实余额记录（带回声防护）
 // ============================================================
-static void btWalletOnSetterValue(const char *clsName, const char *selName, int64_t val) {
+static void btWalletRecordSafe(const char *tag, const char *clsName, const char *selName, int64_t val) {
     if (!g_recordReal || val < 0) return;
 
     if (g_getDisplay) {
         int64_t curDisp = 0;
         int64_t lastReal = 0;
         if (g_getDisplay(&curDisp, &lastReal)) {
-            // 若开关开启且传入值恰好等于我们伪造的显示值（且不等于真实余额），视为内部回声，忽略
             if (val == curDisp && val != lastReal) {
                 return;
             }
@@ -49,12 +56,17 @@ static void btWalletOnSetterValue(const char *clsName, const char *selName, int6
 
     int c = atomic_fetch_add(&g_setLogCount, 1);
     if (c < 30) {
-        WHLOG(@"★ SET %s -%s => real=%lld", clsName, selName, (long long)val);
+        WHLOG(@"★ %s %s -%s => real=%lld", tag, clsName, selName, (long long)val);
     }
 }
 
 static BOOL btWalletComputeGetterValue(const char *clsName, const char *selName,
                                        int64_t origVal, int64_t *outVal) {
+    // 即使 setter 未触发或发生在 hook 之前，从 ivar 读出的真实值也能立即同步 lastReal
+    if (origVal >= 0) {
+        btWalletRecordSafe("GET-SYNC", clsName, selName, origVal);
+    }
+
     if (!g_getDisplay || !outVal) return NO;
 
     int64_t disp = 0;
@@ -71,8 +83,152 @@ static BOOL btWalletComputeGetterValue(const char *clsName, const char *selName,
     return YES;
 }
 
+// 尝试从纯数字展示字符串（如 "13"）解析真实余额，仅在未启用改写或非回声时记录
+static void btWalletTryRecordFromString(const char *clsName, const char *selName, NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || s.length == 0 || s.length > 18) return;
+    uint64_t acc = 0;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c < '0' || c > '9') return;
+        acc = acc * 10ULL + (uint64_t)(c - '0');
+    }
+    btWalletRecordSafe("STR-SYNC", clsName, selName, (int64_t)acc);
+}
+
 // ============================================================
-// 类名过滤：锁定钱包/钻石数据模型与管理器（排除系统框架与 UI/商品类）
+// 精准 Hook：IESLiveWalletMyCoinModel & IESLiveWalletModel
+// ============================================================
+static void btHookDisplayStringGetter(Class cls, const char *clsName, const char *selName) {
+    SEL sel = sel_registerName(selName);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m || method_getNumberOfArguments(m) != 2) return;
+
+    char ret[16] = {0};
+    method_getReturnType(m, ret, sizeof(ret));
+    if (ret[0] != '@') return;
+
+    IMP origImp = method_getImplementation(m);
+    if (!origImp) return;
+
+    typedef id (*Fn)(id, SEL);
+    Fn fn = (Fn)origImp;
+    id (^blk)(id) = ^id(id self_) {
+        id origObj = fn(self_, sel);
+        if ([origObj isKindOfClass:[NSString class]]) {
+            btWalletTryRecordFromString(clsName, selName, (NSString *)origObj);
+        }
+        if (g_getDisplay) {
+            int64_t disp = 0;
+            int64_t lastReal = 0;
+            if (g_getDisplay(&disp, &lastReal)) {
+                int c = atomic_fetch_add(&g_getLogCount, 1);
+                if (c < 30) {
+                    WHLOG(@"★ STR %s -%s: %@ -> %lld", clsName, selName, origObj, (long long)disp);
+                }
+                return [NSString stringWithFormat:@"%lld", (long long)disp];
+            }
+        }
+        return origObj;
+    };
+
+    method_setImplementation(m, imp_implementationWithBlock(blk));
+    WHLOG(@"  [STR] %s -%s (%s)", clsName, selName, method_getTypeEncoding(m) ?: "?");
+}
+
+static void btHookDiamondCntX10(Class cls, const char *clsName) {
+    // 1. getter: -diamondCntX10 (q16@0:8)
+    {
+        SEL sel = sel_registerName("diamondCntX10");
+        Method m = class_getInstanceMethod(cls, sel);
+        if (m && method_getNumberOfArguments(m) == 2) {
+            char ret[16] = {0};
+            method_getReturnType(m, ret, sizeof(ret));
+            if (ret[0] == 'q' || ret[0] == 'Q') {
+                IMP origImp = method_getImplementation(m);
+                typedef long long (*Fn)(id, SEL);
+                Fn fn = (Fn)origImp;
+                long long (^blk)(id) = ^long long(id self_) {
+                    long long origX10 = fn(self_, sel);
+                    int64_t origReal = origX10 >= 0 ? (int64_t)(origX10 / 10) : -1;
+                    int64_t disp = 0;
+                    if (btWalletComputeGetterValue(clsName, "diamondCntX10", origReal, &disp)) {
+                        return (long long)(disp * 10);
+                    }
+                    return origX10;
+                };
+                method_setImplementation(m, imp_implementationWithBlock(blk));
+                WHLOG(@"  [GETx10] %s -diamondCntX10 (%s)", clsName, method_getTypeEncoding(m) ?: "?");
+            }
+        }
+    }
+
+    // 2. setter: -setDiamondCntX10: (v24@0:8q16)
+    {
+        SEL sel = sel_registerName("setDiamondCntX10:");
+        Method m = class_getInstanceMethod(cls, sel);
+        if (m && method_getNumberOfArguments(m) == 3) {
+            char ret[16] = {0};
+            char arg[16] = {0};
+            method_getReturnType(m, ret, sizeof(ret));
+            method_getArgumentType(m, 2, arg, sizeof(arg));
+            if (ret[0] == 'v' && (arg[0] == 'q' || arg[0] == 'Q')) {
+                IMP origImp = method_getImplementation(m);
+                typedef void (*Fn)(id, SEL, long long);
+                Fn fn = (Fn)origImp;
+                void (^blk)(id, long long) = ^(id self_, long long vX10) {
+                    if (vX10 >= 0) {
+                        btWalletRecordSafe("SETx10", clsName, "setDiamondCntX10:", (int64_t)(vX10 / 10));
+                    }
+                    fn(self_, sel, vX10);
+                };
+                method_setImplementation(m, imp_implementationWithBlock(blk));
+                WHLOG(@"  [SETx10] %s -setDiamondCntX10: (%s)", clsName, method_getTypeEncoding(m) ?: "?");
+            }
+        }
+    }
+}
+
+static void btDumpTargetClassMethods(const char *clsName) {
+    Class cls = NSClassFromString([NSString stringWithUTF8String:clsName]);
+    if (!cls) return;
+    unsigned int mc = 0;
+    Method *ms = class_copyMethodList(cls, &mc);
+    if (!ms) return;
+    NSMutableArray<NSString *> *list = [NSMutableArray array];
+    for (unsigned int i = 0; i < mc; i++) {
+        const char *sn = sel_getName(method_getName(ms[i]));
+        if (!sn) continue;
+        if (strcasestr(sn, "diamond") || strcasestr(sn, "balance") || strcasestr(sn, "coin")) {
+            [list addObject:[NSString stringWithFormat:@"%s(%s)", sn, method_getTypeEncoding(ms[i]) ?: "?"]];
+        }
+    }
+    free(ms);
+    if (list.count > 0) {
+        WHLOG(@"[详表] %s (%lu): %@", clsName, (unsigned long)list.count, [list componentsJoinedByString:@", "]);
+    }
+}
+
+static void btHookKnownDouyinWalletClasses(void) {
+    Class myCoin = NSClassFromString(@"IESLiveWalletMyCoinModel");
+    if (myCoin) {
+        WHLOG(@"精准命中类: IESLiveWalletMyCoinModel");
+        btHookDiamondCntX10(myCoin, "IESLiveWalletMyCoinModel");
+        btHookDisplayStringGetter(myCoin, "IESLiveWalletMyCoinModel", "diamondCntDisplayString");
+        btDumpTargetClassMethods("IESLiveWalletMyCoinModel");
+    }
+
+    Class walletModel = NSClassFromString(@"IESLiveWalletModel");
+    if (walletModel) {
+        WHLOG(@"精准命中类: IESLiveWalletModel");
+        btHookDisplayStringGetter(walletModel, "IESLiveWalletModel", "diamondNumDisplayString");
+        btDumpTargetClassMethods("IESLiveWalletModel");
+    }
+
+    btDumpTargetClassMethods("IESLiveWalletManager");
+}
+
+// ============================================================
+// 通用类名过滤：锁定钱包/钻石数据模型与管理器（排除系统框架与 UI/商品类）
 // ============================================================
 static BOOL btIsSystemPrefix(const char *name) {
     static const char *sysPrefixes[] = {
@@ -93,12 +249,10 @@ static BOOL btIsTargetWalletClass(const char *name) {
     if (!name || !*name) return NO;
     if (btIsSystemPrefix(name)) return NO;
 
-    // 必须包含核心关键词
     if (!strstr(name, "Wallet") && !strstr(name, "Diamond")) {
         return NO;
     }
 
-    // 排除 UI / 商品 / 充值档位 / 礼物 / 订单 / 埋点 / 配置类（防止误改商品价格或档位）
     static const char *excludes[] = {
         "ViewController", "Cell", "Button", "Label", "Image", "Icon",
         "Banner", "Popup", "Alert", "Dialog", "Sheet", "Layout", "Style",
@@ -113,12 +267,9 @@ static BOOL btIsTargetWalletClass(const char *name) {
         "Entrance", "Card", "Tab", "List", "Buy",
     };
     for (size_t i = 0; i < sizeof(excludes) / sizeof(excludes[0]); i++) {
-        if (strstr(name, excludes[i])) {
-            return NO;
-        }
+        if (strstr(name, excludes[i])) return NO;
     }
 
-    // 排除普通 View（保留 ViewModel）
     if (strstr(name, "View") && !strstr(name, "ViewModel")) {
         return NO;
     }
@@ -127,7 +278,7 @@ static BOOL btIsTargetWalletClass(const char *name) {
 }
 
 // ============================================================
-// 方法名精确白名单
+// 通用方法名精确白名单
 // ============================================================
 static BOOL btIsBalanceGetter(const char *sn) {
     static const char *getters[] = {
@@ -190,9 +341,10 @@ static BOOL btIsBalanceSetter(const char *sn) {
 }
 
 // ============================================================
-// 按严格类型编码 Swizzle Getter
+// 按严格类型编码 Swizzle Getter（含 q / Q / i / I / d / @）
 // ============================================================
 static BOOL btSwizzleGetter(Class cls, Method m, const char *clsName, const char *selName) {
+    (void)cls;
     if (method_getNumberOfArguments(m) != 2) return NO;
 
     char ret[16] = {0};
@@ -202,7 +354,7 @@ static BOOL btSwizzleGetter(Class cls, Method m, const char *clsName, const char
     if (!origImp) return NO;
 
     switch (ret[0]) {
-    case 'q': { // long long / int64_t / NSInteger
+    case 'q': {
         typedef long long (*Fn)(id, SEL);
         Fn fn = (Fn)origImp;
         long long (^blk)(id) = ^long long(id self_) {
@@ -216,7 +368,7 @@ static BOOL btSwizzleGetter(Class cls, Method m, const char *clsName, const char
         method_setImplementation(m, imp_implementationWithBlock(blk));
         return YES;
     }
-    case 'Q': { // unsigned long long / uint64_t / NSUInteger
+    case 'Q': {
         typedef unsigned long long (*Fn)(id, SEL);
         Fn fn = (Fn)origImp;
         unsigned long long (^blk)(id) = ^unsigned long long(id self_) {
@@ -230,7 +382,7 @@ static BOOL btSwizzleGetter(Class cls, Method m, const char *clsName, const char
         method_setImplementation(m, imp_implementationWithBlock(blk));
         return YES;
     }
-    case 'i': { // int
+    case 'i': {
         typedef int (*Fn)(id, SEL);
         Fn fn = (Fn)origImp;
         int (^blk)(id) = ^int(id self_) {
@@ -245,7 +397,7 @@ static BOOL btSwizzleGetter(Class cls, Method m, const char *clsName, const char
         method_setImplementation(m, imp_implementationWithBlock(blk));
         return YES;
     }
-    case 'I': { // unsigned int
+    case 'I': {
         typedef unsigned int (*Fn)(id, SEL);
         Fn fn = (Fn)origImp;
         unsigned int (^blk)(id) = ^unsigned int(id self_) {
@@ -261,7 +413,21 @@ static BOOL btSwizzleGetter(Class cls, Method m, const char *clsName, const char
         method_setImplementation(m, imp_implementationWithBlock(blk));
         return YES;
     }
-    case '@': { // NSNumber *（仅当运行时返回值为 NSNumber 时替换，其他对象原样返回）
+    case 'd': {
+        typedef double (*Fn)(id, SEL);
+        Fn fn = (Fn)origImp;
+        double (^blk)(id) = ^double(id self_) {
+            double origVal = fn(self_, sel);
+            int64_t disp = 0;
+            if (btWalletComputeGetterValue(clsName, selName, (int64_t)origVal, &disp)) {
+                return (double)disp;
+            }
+            return origVal;
+        };
+        method_setImplementation(m, imp_implementationWithBlock(blk));
+        return YES;
+    }
+    case '@': {
         typedef id (*Fn)(id, SEL);
         Fn fn = (Fn)origImp;
         id (^blk)(id) = ^id(id self_) {
@@ -284,7 +450,7 @@ static BOOL btSwizzleGetter(Class cls, Method m, const char *clsName, const char
 }
 
 // ============================================================
-// 按严格类型编码 Swizzle Setter（记录真实值，并原样写入真实值）
+// 按严格类型编码 Swizzle Setter（记录真实值，原样写入）
 // ============================================================
 static BOOL btSwizzleSetter(Class cls, Method m, const char *clsName, const char *selName) {
     (void)cls;
@@ -305,7 +471,7 @@ static BOOL btSwizzleSetter(Class cls, Method m, const char *clsName, const char
         typedef void (*Fn)(id, SEL, long long);
         Fn fn = (Fn)origImp;
         void (^blk)(id, long long) = ^(id self_, long long v) {
-            btWalletOnSetterValue(clsName, selName, (int64_t)v);
+            btWalletRecordSafe("SET", clsName, selName, (int64_t)v);
             fn(self_, sel, v);
         };
         method_setImplementation(m, imp_implementationWithBlock(blk));
@@ -316,7 +482,7 @@ static BOOL btSwizzleSetter(Class cls, Method m, const char *clsName, const char
         Fn fn = (Fn)origImp;
         void (^blk)(id, unsigned long long) = ^(id self_, unsigned long long v) {
             int64_t sv = (v > (unsigned long long)INT64_MAX) ? INT64_MAX : (int64_t)v;
-            btWalletOnSetterValue(clsName, selName, sv);
+            btWalletRecordSafe("SET", clsName, selName, sv);
             fn(self_, sel, v);
         };
         method_setImplementation(m, imp_implementationWithBlock(blk));
@@ -326,7 +492,7 @@ static BOOL btSwizzleSetter(Class cls, Method m, const char *clsName, const char
         typedef void (*Fn)(id, SEL, int);
         Fn fn = (Fn)origImp;
         void (^blk)(id, int) = ^(id self_, int v) {
-            btWalletOnSetterValue(clsName, selName, (int64_t)v);
+            btWalletRecordSafe("SET", clsName, selName, (int64_t)v);
             fn(self_, sel, v);
         };
         method_setImplementation(m, imp_implementationWithBlock(blk));
@@ -336,7 +502,17 @@ static BOOL btSwizzleSetter(Class cls, Method m, const char *clsName, const char
         typedef void (*Fn)(id, SEL, unsigned int);
         Fn fn = (Fn)origImp;
         void (^blk)(id, unsigned int) = ^(id self_, unsigned int v) {
-            btWalletOnSetterValue(clsName, selName, (int64_t)v);
+            btWalletRecordSafe("SET", clsName, selName, (int64_t)v);
+            fn(self_, sel, v);
+        };
+        method_setImplementation(m, imp_implementationWithBlock(blk));
+        return YES;
+    }
+    case 'd': {
+        typedef void (*Fn)(id, SEL, double);
+        Fn fn = (Fn)origImp;
+        void (^blk)(id, double) = ^(id self_, double v) {
+            if (v >= 0) btWalletRecordSafe("SET", clsName, selName, (int64_t)v);
             fn(self_, sel, v);
         };
         method_setImplementation(m, imp_implementationWithBlock(blk));
@@ -347,7 +523,7 @@ static BOOL btSwizzleSetter(Class cls, Method m, const char *clsName, const char
         Fn fn = (Fn)origImp;
         void (^blk)(id, id) = ^(id self_, id obj) {
             if ([obj isKindOfClass:[NSNumber class]]) {
-                btWalletOnSetterValue(clsName, selName, [(NSNumber *)obj longLongValue]);
+                btWalletRecordSafe("SET", clsName, selName, [(NSNumber *)obj longLongValue]);
             }
             fn(self_, sel, obj);
         };
@@ -367,6 +543,10 @@ void BTInstallWalletModelHook(void) {
     dispatch_once(&once, ^{
         WHLOG(@"========== 方案2: 钱包 Model/Manager Hook 启动 ==========");
 
+        // 1. 优先精准 Hook 真机已确认的抖音核心钱包模型
+        btHookKnownDouyinWalletClasses();
+
+        // 2. 补充扫描其他钱包/钻石类的标准余额属性
         int total = objc_getClassList(NULL, 0);
         if (total <= 0) return;
         Class *classes = (Class *)malloc(sizeof(Class) * (size_t)total);
@@ -376,7 +556,6 @@ void BTInstallWalletModelHook(void) {
         int matchedClasses = 0;
         int hookedGetters = 0;
         int hookedSetters = 0;
-        int candidateLogged = 0;
 
         for (int i = 0; i < total; i++) {
             Class cls = classes[i];
@@ -389,8 +568,6 @@ void BTInstallWalletModelHook(void) {
             if (!methods) continue;
 
             BOOL classLogged = NO;
-            NSMutableArray<NSString *> *otherHits = nil;
-
             for (unsigned int k = 0; k < mc; k++) {
                 Method m = methods[k];
                 const char *sn = sel_getName(method_getName(m));
@@ -404,12 +581,6 @@ void BTInstallWalletModelHook(void) {
                 } else if (btIsBalanceSetter(sn)) {
                     hooked = btSwizzleSetter(cls, m, clsName, sn);
                     if (hooked) { hookedSetters++; kind = "SET"; }
-                } else if (candidateLogged < 20 &&
-                           (strcasestr(sn, "diamond") || strcasestr(sn, "balance"))) {
-                    if (!otherHits) otherHits = [NSMutableArray array];
-                    if (otherHits.count < 6) {
-                        [otherHits addObject:[NSString stringWithFormat:@"%s(%s)", sn, method_getTypeEncoding(m) ?: "?"]];
-                    }
                 }
 
                 if (hooked) {
@@ -421,15 +592,11 @@ void BTInstallWalletModelHook(void) {
                     WHLOG(@"  [%s] -%s (%s)", kind, sn, method_getTypeEncoding(m) ?: "?");
                 }
             }
-            if (!classLogged && otherHits.count > 0 && candidateLogged < 20) {
-                candidateLogged++;
-                WHLOG(@"[候选] %s: %@", clsName, [otherHits componentsJoinedByString:@", "]);
-            }
             free(methods);
         }
 
         free(classes);
-        WHLOG(@"========== 完成: 命中类 %d, getter %d, setter %d (候选 %d) ==========",
-              matchedClasses, hookedGetters, hookedSetters, candidateLogged);
+        WHLOG(@"========== 完成: 通用命中类 %d, getter %d, setter %d ==========",
+              matchedClasses, hookedGetters, hookedSetters);
     });
 }
