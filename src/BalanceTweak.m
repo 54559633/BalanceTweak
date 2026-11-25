@@ -26,6 +26,7 @@
 #import "BTLog.h"
 #import "BTProtocol.h"
 #import "BTTTNetProbe.h"
+#import "BTWalletHook.h"
 #import "BTLogVC.h"
 #import "BTSSLHook.h"
 
@@ -705,6 +706,21 @@ static NSData *btProtocolPatch(NSURL *url, NSData *data) {
 }
 
 // ============================================================
+// 方案 2（钱包 Model / Manager 层）回调桥接
+// ============================================================
+static void btWalletRecordReal(int64_t realVal) {
+    [[BTPrefs shared] recordRealBalance:realVal outDisplay:NULL shouldPatch:NULL];
+}
+
+static BOOL btWalletGetDisplay(int64_t *outDisplay, int64_t *outLastReal) {
+    BTPrefsSnapshot *s = [[BTPrefs shared] snapshot];
+    if (outLastReal) *outLastReal = s.hasLastReal ? s.lastReal : 0;
+    if (!s.enabled || !s.hasBaseDisplay) return NO;
+    if (outDisplay) *outDisplay = s.computedDisplay;
+    return YES;
+}
+
+// ============================================================
 // 入口
 // ============================================================
 __attribute__((constructor))
@@ -724,16 +740,20 @@ static void BTInit(void) {
 
     BOOL safeMode = [[NSUserDefaults standardUserDefaults] boolForKey:@"BT_safemode_v5"];
 
-    BTLOG(@"================ 加载 (v5) ================");
+    BTLOG(@"================ 加载 (v5+WalletHook) ================");
     if (crashed) BTLOG(@"⚠ 检测到上次崩溃 → 已进入安全模式");
     BTLOG(@"安全模式: %@", safeMode ? @"开" : @"关");
     BTLOG(@"三指长按 1 秒 → 打开设置");
 
-    // ★ 方案 A：NSURLProtocol 拦截（已注入 NSURLSessionConfiguration）
-    BTInstallURLProtocol();
-    BTSetPatchFunc(btProtocolPatch);
+    // ★ 方案 2（主力）：直接 Swizzle 抖音钱包 Model / Manager 层（纯 ObjC，绕过网络库与 Protobuf）
+    BTSetWalletCallbacks(btWalletRecordReal, btWalletGetDisplay);
+    if (!safeMode) {
+        BTInstallWalletModelHook();
+    } else {
+        BTLOG(@"安全模式：跳过 WalletHook（可在设置界面点「重置」恢复）");
+    }
 
-    // ★ 方案 C：TTNet 精准 Hook（主力：拦截 TTNetworkManagerChromium / TTHttpTaskChromium）
+    // ★ 方案 1（辅助）：TTNet 精准 Hook（拦截 TTNetworkManagerChromium / TTHttpTaskChromium）
     BTSetTTNetPatchFunc(btProtocolPatch);
     if (!safeMode) {
         BTInstallTTNetProbe();
@@ -741,7 +761,9 @@ static void BTInit(void) {
         BTLOG(@"安全模式：跳过 TTNetHook（可在设置界面点「重置」恢复）");
     }
 
-    // ★ 方案 B：NSURLSession completion hook（兜底）
+    // ★ 方案 A/B（兜底）：NSURLProtocol + NSURLSession completion hook
+    BTInstallURLProtocol();
+    BTSetPatchFunc(btProtocolPatch);
     [BTNet install];
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
