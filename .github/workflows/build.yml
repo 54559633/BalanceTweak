@@ -55,7 +55,7 @@ jobs:
           xcrun clang++ -c -target arm64-apple-ios14.0 -isysroot "$SDK" \
             -fobjc-arc -O2 -fvisibility=hidden \
             -std=c++17 -I src/auth \
-            src/auth/JJCloudCore.cpp src/auth/JJCloudApple.mm src/auth/JJCloudAuthUI.mm src/auth/JJCloudVerifier.mm
+            src/auth/JJCloudCore.cpp src/auth/JJCloudApple.mm src/auth/JJCloudAuthUI.mm src/auth/JJCloudVerifier.mm src/auth/BTLocationStubs.mm
 
           echo "=== 3. Link ==="
           xcrun clang++ -dynamiclib -target arm64-apple-ios14.0 -isysroot "$SDK" \
@@ -63,7 +63,7 @@ jobs:
             -framework UIKit \
             -framework Foundation \
             -framework Security \
-            -framework Network \
+            -framework Network \`n            -framework CoreGraphics \
             -o build-arm64.dylib \
             BalanceTweak.o BTProtocol.o BTTTNetProbe.o BTWalletHook.o BTLog.o BTLogVC.o JJCloudCore.o JJCloudApple.o JJCloudAuthUI.o JJCloudVerifier.o
           echo "arm64 built: $(ls -lh build-arm64.dylib)"
@@ -82,7 +82,7 @@ jobs:
           xcrun clang++ -c -target arm64e-apple-ios14.0 -isysroot "$SDK" \
             -fobjc-arc -O2 -fvisibility=hidden \
             -std=c++17 -I src/auth \
-            src/auth/JJCloudCore.cpp src/auth/JJCloudApple.mm src/auth/JJCloudAuthUI.mm src/auth/JJCloudVerifier.mm
+            src/auth/JJCloudCore.cpp src/auth/JJCloudApple.mm src/auth/JJCloudAuthUI.mm src/auth/JJCloudVerifier.mm src/auth/BTLocationStubs.mm
 
           echo "=== 3. Link ==="
           xcrun clang++ -dynamiclib -target arm64e-apple-ios14.0 -isysroot "$SDK" \
@@ -90,7 +90,7 @@ jobs:
             -framework UIKit \
             -framework Foundation \
             -framework Security \
-            -framework Network \
+            -framework Network \`n            -framework CoreGraphics \
             -o build-arm64e.dylib \
             BalanceTweak.o BTProtocol.o BTTTNetProbe.o BTWalletHook.o BTLog.o BTLogVC.o JJCloudCore.o JJCloudApple.o JJCloudAuthUI.o JJCloudVerifier.o
           echo "arm64e built: $(ls -lh build-arm64e.dylib)"
