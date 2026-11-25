@@ -1,16 +1,13 @@
 //
-// BTTTNetProbe.m —— TTNet 精准拦截器（v5 非越狱安全版）
+// BTTTNetProbe.m —— 钱包首页（CJPay/Lynx）JSON + TTNet 精准拦截器
 // ============================================================
-// 基于真机日志确认的精准方法：
+// 覆盖「我 → 我的钱包」首页的「钻石」数值：
 //   1. TTNetworkManagerChromium
 //      -handleResponsePreProcessing_:data:error:request:preprocessor:headerCallback:dataCallback:completedCallback:
-//   2. TTHttpTaskChromium
-//      -onReadResponseData:
-//
-// 安全保障：
-//   - 完全移除 _objc_msgForward 和批量类扫描 hook（零崩溃）
-//   - swizzle 前严格校验参数个数、返回类型、每个参数类型编码
-//   - 通过 associated object 防止同一请求被两个 hook 重复改写
+//      （真机实测签名: B80@0:8@16@24@32@40@48@?56@?64@?72）
+//   2. BDXBridgeTtcjpayMultiNetRequestMethod
+//      -p_handleResponse:object:error:expectedTrafficPath:completionHandler:
+//      （财经钱包 Lynx 页面专用 JSBridge 网络回调）
 // ============================================================
 
 #import "BTTTNetProbe.h"
@@ -34,15 +31,195 @@ void BTStopTTNetProbe(void) {
 }
 
 // ============================================================
-// 安全读取对象属性（仅当方法返回类型为 '@' 时调用）
+// 钱包首页 JSON 递归改写（定位 "钻石" 卡片并替换余额数值）
+// ============================================================
+static BOOL btIsPureNonNegIntString(NSString *s, int64_t *outVal) {
+    if (![s isKindOfClass:[NSString class]] || s.length == 0 || s.length > 18) return NO;
+    uint64_t acc = 0;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c < '0' || c > '9') return NO;
+        acc = acc * 10ULL + (uint64_t)(c - '0');
+    }
+    if (outVal) *outVal = (int64_t)acc;
+    return YES;
+}
+
+static BOOL btIsBoolNumber(id obj) {
+    if (![obj isKindOfClass:[NSNumber class]]) return NO;
+    return CFGetTypeID((__bridge CFTypeRef)obj) == CFBooleanGetTypeID();
+}
+
+static BOOL btDictLooksLikeDiamondCard(NSDictionary *dict) {
+    for (id key in dict) {
+        id val = dict[key];
+        if ([val isKindOfClass:[NSString class]]) {
+            NSString *s = (NSString *)val;
+            if ([s isEqualToString:@"钻石"] || ([s containsString:@"钻石"] && s.length <= 6)) {
+                return YES;
+            }
+            if ([key isKindOfClass:[NSString class]]) {
+                NSString *kl = [(NSString *)key lowercaseString];
+                if (([kl isEqualToString:@"code"] || [kl isEqualToString:@"biz_code"] ||
+                     [kl isEqualToString:@"asset_type"] || [kl isEqualToString:@"type"]) &&
+                    [s.lowercaseString containsString:@"diamond"]) {
+                    return YES;
+                }
+            }
+        }
+    }
+    return NO;
+}
+
+static BOOL btKeyLooksLikeBalanceField(id key) {
+    if (![key isKindOfClass:[NSString class]]) return NO;
+    NSString *kl = [(NSString *)key lowercaseString];
+    return ([kl containsString:@"amount"] || [kl containsString:@"value"] ||
+            [kl containsString:@"balance"] || [kl containsString:@"count"] ||
+            [kl containsString:@"cnt"] || [kl containsString:@"num"] ||
+            [kl containsString:@"sub_title"] || [kl containsString:@"subtitle"] ||
+            [kl containsString:@"desc"] || [kl containsString:@"text"] ||
+            [kl containsString:@"display"]);
+}
+
+static id btPatchJSONRecursive(id obj,
+                               int64_t realVal,
+                               BOOL hasRealVal,
+                               NSString *realStr,
+                               int64_t dispVal,
+                               NSString *dispStr,
+                               BOOL shouldPatch,
+                               BOOL inDiamondCtx,
+                               int depth,
+                               int64_t *outDetectedReal,
+                               BOOL *outDidChange) {
+    if (!obj || depth > 12) return obj;
+
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)obj;
+        BOOL isDiamond = inDiamondCtx || btDictLooksLikeDiamondCard(dict);
+        NSMutableDictionary *mut = nil;
+
+        for (id key in dict) {
+            id val = dict[key];
+            id newVal = val;
+
+            if (isDiamond && [val isKindOfClass:[NSString class]]) {
+                NSString *s = (NSString *)val;
+                int64_t parsed = 0;
+                if (btIsPureNonNegIntString(s, &parsed)) {
+                    BOOL matches = (hasRealVal && parsed == realVal) ||
+                                   (!hasRealVal && btKeyLooksLikeBalanceField(key));
+                    if (matches) {
+                        if (outDetectedReal && *outDetectedReal < 0) *outDetectedReal = parsed;
+                        if (shouldPatch) {
+                            newVal = dispStr;
+                            if (outDidChange) *outDidChange = YES;
+                            TTHLOG(@"★ [WalletJSON] 改写字段 %@: \"%@\" -> \"%@\"", key, s, dispStr);
+                        }
+                    }
+                } else if (s.length >= 2 && ([s hasPrefix:@"{"] || [s hasPrefix:@"["])) {
+                    newVal = btPatchJSONRecursive(val, realVal, hasRealVal, realStr, dispVal, dispStr,
+                                                  shouldPatch, isDiamond, depth + 1, outDetectedReal, outDidChange);
+                }
+            } else if (isDiamond && [val isKindOfClass:[NSNumber class]] && !btIsBoolNumber(val)) {
+                int64_t nv = [(NSNumber *)val longLongValue];
+                BOOL matches = (hasRealVal && nv == realVal) ||
+                               (!hasRealVal && btKeyLooksLikeBalanceField(key));
+                if (matches) {
+                    if (outDetectedReal && *outDetectedReal < 0) *outDetectedReal = nv;
+                    if (shouldPatch) {
+                        newVal = @(dispVal);
+                        if (outDidChange) *outDidChange = YES;
+                        TTHLOG(@"★ [WalletJSON] 改写数值 %@: %lld -> %lld", key, (long long)nv, (long long)dispVal);
+                    }
+                }
+            } else {
+                newVal = btPatchJSONRecursive(val, realVal, hasRealVal, realStr, dispVal, dispStr,
+                                              shouldPatch, isDiamond, depth + 1, outDetectedReal, outDidChange);
+            }
+
+            if (newVal != val) {
+                if (!mut) mut = [dict mutableCopy];
+                mut[key] = newVal;
+            }
+        }
+        return mut ?: dict;
+    }
+
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSArray *arr = (NSArray *)obj;
+        NSMutableArray *mut = nil;
+        for (NSUInteger i = 0; i < arr.count; i++) {
+            id item = arr[i];
+            id newItem = btPatchJSONRecursive(item, realVal, hasRealVal, realStr, dispVal, dispStr,
+                                              shouldPatch, inDiamondCtx, depth + 1, outDetectedReal, outDidChange);
+            if (newItem != item) {
+                if (!mut) mut = [arr mutableCopy];
+                mut[i] = newItem;
+            }
+        }
+        return mut ?: arr;
+    }
+
+    // 处理抖音财经接口常见的嵌套 JSON 字符串（如 biz_data / data 字段）
+    if ([obj isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)obj;
+        if (s.length >= 4 && s.length < 500000 &&
+            ([s hasPrefix:@"{"] || [s hasPrefix:@"["]) &&
+            ([s containsString:@"钻石"] || [s.lowercaseString containsString:@"diamond"])) {
+            NSData *subData = [s dataUsingEncoding:NSUTF8StringEncoding];
+            if (subData) {
+                id subObj = [NSJSONSerialization JSONObjectWithData:subData options:0 error:nil];
+                if (subObj) {
+                    BOOL subChanged = NO;
+                    id patchedSub = btPatchJSONRecursive(subObj, realVal, hasRealVal, realStr, dispVal, dispStr,
+                                                         shouldPatch, inDiamondCtx, depth + 1,
+                                                         outDetectedReal, &subChanged);
+                    if (subChanged && patchedSub && [NSJSONSerialization isValidJSONObject:patchedSub]) {
+                        NSData *reEnc = [NSJSONSerialization dataWithJSONObject:patchedSub options:0 error:nil];
+                        if (reEnc) {
+                            NSString *reStr = [[NSString alloc] initWithData:reEnc encoding:NSUTF8StringEncoding];
+                            if (reStr) {
+                                if (outDidChange) *outDidChange = YES;
+                                return reStr;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return obj;
+}
+
+id BTPatchWalletJSONObject(id obj,
+                           int64_t realVal,
+                           BOOL hasRealVal,
+                           int64_t dispVal,
+                           BOOL shouldPatch,
+                           int64_t *outDetectedReal,
+                           BOOL *outDidChange) {
+    if (!obj) return nil;
+    if (outDetectedReal) *outDetectedReal = -1;
+    if (outDidChange) *outDidChange = NO;
+
+    NSString *realStr = [NSString stringWithFormat:@"%lld", (long long)realVal];
+    NSString *dispStr = [NSString stringWithFormat:@"%lld", (long long)dispVal];
+    return btPatchJSONRecursive(obj, realVal, hasRealVal, realStr, dispVal, dispStr,
+                                shouldPatch, NO, 0, outDetectedReal, outDidChange);
+}
+
+// ============================================================
+// 安全读取对象属性与 URL 匹配
 // ============================================================
 static id btSafeGetObjectProp(id obj, SEL sel) {
     if (!obj || !sel) return nil;
     Class cls = object_getClass(obj);
     if (!cls) return nil;
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return nil;
-    if (method_getNumberOfArguments(m) != 2) return nil;
+    if (!m || method_getNumberOfArguments(m) != 2) return nil;
     char retType[16] = {0};
     method_getReturnType(m, retType, sizeof(retType));
     if (retType[0] != '@') return nil;
@@ -88,15 +265,14 @@ static NSURL *btExtractURL(id obj) {
 
 static BOOL btIsTargetWalletURL(NSURL *url) {
     if (!url) return NO;
-    NSString *s = url.path.length > 0 ? url.path : (url.absoluteString ?: @"");
-    return ([s containsString:@"/webcast/wallet/info/"] ||
+    NSString *s = (url.path.length > 0 ? url.path : (url.absoluteString ?: @"")).lowercaseString;
+    return ([s containsString:@"/webcast/wallet/info"] ||
             [s containsString:@"wallet_api/recharge_page"] ||
-            [s containsString:@"wallet/core/v1/homepage/index"]);
+            [s containsString:@"wallet/core/v1/homepage"] ||
+            [s containsString:@"caijing/wallet"] ||
+            [s containsString:@"wallet/homepage"]);
 }
 
-// ============================================================
-// 统一改写入口（带去重，防止重复 patch）
-// ============================================================
 static id btMaybePatchData(NSURL *url, id rawData, id dedupObj, const char *source) {
     if (!g_active || !g_patchFunc || !url || !rawData) return rawData;
     if (![rawData isKindOfClass:[NSData class]]) return rawData;
@@ -104,12 +280,8 @@ static id btMaybePatchData(NSURL *url, id rawData, id dedupObj, const char *sour
     NSData *data = (NSData *)rawData;
     if (data.length == 0) return rawData;
 
-    if (objc_getAssociatedObject(rawData, &kBTPatchedKey) != nil) {
-        return rawData;
-    }
-    if (dedupObj && objc_getAssociatedObject(dedupObj, &kBTPatchedKey) != nil) {
-        return rawData;
-    }
+    if (objc_getAssociatedObject(rawData, &kBTPatchedKey) != nil) return rawData;
+    if (dedupObj && objc_getAssociatedObject(dedupObj, &kBTPatchedKey) != nil) return rawData;
 
     TTHLOG(@"★★★ 命中 [%s] %@ (%luB)", source, url.path ?: url.absoluteString, (unsigned long)data.length);
 
@@ -125,18 +297,13 @@ static id btMaybePatchData(NSURL *url, id rawData, id dedupObj, const char *sour
         objc_setAssociatedObject(dedupObj, &kBTPatchedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
-    if (!patched || patched.length == 0) {
-        return rawData;
-    }
+    if (!patched || patched.length == 0) return rawData;
 
     id result = [rawData isKindOfClass:[NSMutableData class]] ? [patched mutableCopy] : patched;
     objc_setAssociatedObject(result, &kBTPatchedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return result;
 }
 
-// ============================================================
-// 校验所有显式参数是否为对象/Block ('@')，确保 arm64/arm64e ABI 100% 安全
-// ============================================================
 static BOOL btVerifyObjectArgs(Method m, unsigned int expectedTotalArgs, char *outRetType) {
     if (!m) return NO;
     unsigned int argc = method_getNumberOfArguments(m);
@@ -155,44 +322,26 @@ static BOOL btVerifyObjectArgs(Method m, unsigned int expectedTotalArgs, char *o
     return YES;
 }
 
-static BOOL btIsWalletDebugURL(NSURL *url) {
-    if (!url) return NO;
-    NSString *s = (url.path.length > 0 ? url.path : (url.absoluteString ?: @"")).lowercaseString;
-    return ([s containsString:@"wallet"] || [s containsString:@"diamond"] || [s containsString:@"recharge"]);
-}
-
 // ============================================================
-// Hook 1: TTNetworkManagerChromium
-//   -handleResponsePreProcessing_:data:error:request:preprocessor:headerCallback:dataCallback:completedCallback:
+// Hook 1: TTNetworkManagerChromium -handleResponsePreProcessing_:...
 //   实测签名: B80@0:8@16@24@32@40@48@?56@?64@?72
 // ============================================================
 static void btHookHandleResponsePreProcessing(void) {
     Class cls = NSClassFromString(@"TTNetworkManagerChromium");
-    if (!cls) {
-        TTHLOG(@"未找到 TTNetworkManagerChromium");
-        return;
-    }
+    if (!cls) return;
 
     SEL sel = NSSelectorFromString(
         @"handleResponsePreProcessing_:data:error:request:preprocessor:headerCallback:dataCallback:completedCallback:");
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) {
-        TTHLOG(@"TTNetworkManagerChromium 无 handleResponsePreProcessing_:");
-        return;
-    }
-
-    const char *enc = method_getTypeEncoding(m);
-    TTHLOG(@"handleResponsePreProcessing_ 签名: %s", enc ?: "?");
+    if (!m) return;
 
     char retType = 0;
     if (!btVerifyObjectArgs(m, 10, &retType)) {
-        TTHLOG(@"handleResponsePreProcessing_ 参数签名不符，跳过以防崩溃");
+        TTHLOG(@"handleResponsePreProcessing_ 签名不符: %s", method_getTypeEncoding(m) ?: "?");
         return;
     }
 
     IMP origImp = method_getImplementation(m);
-    static int dbgCount = 0;
-
     if (retType == 'B' || retType == 'c') {
         typedef BOOL (*Fn)(id, SEL, id, id, id, id, id, id, id, id);
         Fn fn = (Fn)origImp;
@@ -203,116 +352,78 @@ static void btHookHandleResponsePreProcessing(void) {
                 NSURL *url = btExtractURL(req) ?: btExtractURL(resp);
                 if (btIsTargetWalletURL(url)) {
                     outData = btMaybePatchData(url, data, req ?: resp, "PreProcessing");
-                } else if (dbgCount < 15 && btIsWalletDebugURL(url)) {
-                    dbgCount++;
-                    NSUInteger len = [data isKindOfClass:[NSData class]] ? ((NSData *)data).length : 0;
-                    TTHLOG(@"[观察] PreProcessing wallet相关: %@ (%luB)", url.path ?: url.absoluteString, (unsigned long)len);
                 }
             }
             return fn(self_, sel, resp, outData, err, req, pre, hdrCb, dataCb, compCb);
         };
         method_setImplementation(m, imp_implementationWithBlock(blk));
-    } else if (retType == 'v') {
-        typedef void (*Fn)(id, SEL, id, id, id, id, id, id, id, id);
-        Fn fn = (Fn)origImp;
-        void (^blk)(id, id, id, id, id, id, id, id, id) =
-            ^(id self_, id resp, id data, id err, id req, id pre, id hdrCb, id dataCb, id compCb) {
-            id outData = data;
-            if (data && !err) {
-                NSURL *url = btExtractURL(req) ?: btExtractURL(resp);
-                if (btIsTargetWalletURL(url)) {
-                    outData = btMaybePatchData(url, data, req ?: resp, "PreProcessing");
-                }
-            }
-            fn(self_, sel, resp, outData, err, req, pre, hdrCb, dataCb, compCb);
-        };
-        method_setImplementation(m, imp_implementationWithBlock(blk));
-    } else {
-        typedef id (*Fn)(id, SEL, id, id, id, id, id, id, id, id);
-        Fn fn = (Fn)origImp;
-        id (^blk)(id, id, id, id, id, id, id, id, id) =
-            ^id(id self_, id resp, id data, id err, id req, id pre, id hdrCb, id dataCb, id compCb) {
-            id outData = data;
-            if (data && !err) {
-                NSURL *url = btExtractURL(req) ?: btExtractURL(resp);
-                if (btIsTargetWalletURL(url)) {
-                    outData = btMaybePatchData(url, data, req ?: resp, "PreProcessing");
-                }
-            }
-            return fn(self_, sel, resp, outData, err, req, pre, hdrCb, dataCb, compCb);
-        };
-        method_setImplementation(m, imp_implementationWithBlock(blk));
+        TTHLOG(@"✓ 已 hook TTNetworkManagerChromium -handleResponsePreProcessing_:");
     }
-    TTHLOG(@"✓ 已 hook TTNetworkManagerChromium -handleResponsePreProcessing_: (ret=%c)", retType);
 }
 
 // ============================================================
-// Hook 2: TTHttpTaskChromium -onReadResponseData:
+// Hook 2: BDXBridgeTtcjpayMultiNetRequestMethod
+//   -p_handleResponse:object:error:expectedTrafficPath:completionHandler:
 // ============================================================
-static void btHookOnReadResponseData(void) {
-    Class cls = NSClassFromString(@"TTHttpTaskChromium");
-    if (!cls) {
-        TTHLOG(@"未找到 TTHttpTaskChromium");
-        return;
-    }
+static void btHookCJPayBridgeResponse(void) {
+    Class cls = NSClassFromString(@"BDXBridgeTtcjpayMultiNetRequestMethod");
+    if (!cls) return;
 
-    SEL sel = NSSelectorFromString(@"onReadResponseData:");
+    SEL sel = NSSelectorFromString(@"p_handleResponse:object:error:expectedTrafficPath:completionHandler:");
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) {
-        TTHLOG(@"TTHttpTaskChromium 无 onReadResponseData:");
-        return;
-    }
+    if (!m) return;
 
     const char *enc = method_getTypeEncoding(m);
-    TTHLOG(@"onReadResponseData: 签名: %s", enc ?: "?");
+    TTHLOG(@"CJPayBridge p_handleResponse 签名: %s", enc ?: "?");
 
     char retType = 0;
-    if (!btVerifyObjectArgs(m, 3, &retType) || retType != 'v') {
-        TTHLOG(@"onReadResponseData: 签名不符，跳过");
+    if (!btVerifyObjectArgs(m, 7, &retType) || retType != 'v') {
+        TTHLOG(@"CJPayBridge 签名不符，跳过");
         return;
     }
 
     IMP origImp = method_getImplementation(m);
-    typedef void (*Fn)(id, SEL, id);
+    typedef void (*Fn)(id, SEL, id, id, id, id, id);
     Fn fn = (Fn)origImp;
 
-    void (^blk)(id, id) = ^(id self_, id data) {
-        id outData = data;
-        if (data) {
-            NSURL *url = btExtractURL(self_);
+    void (^blk)(id, id, id, id, id, id) = ^(id self_, id resp, id obj, id err, id trafficPath, id comp) {
+        id outObj = obj;
+        if (g_active && g_patchFunc && obj && !err) {
+            NSURL *url = btExtractURL(resp);
+            if (!url && [trafficPath isKindOfClass:[NSString class]]) {
+                url = [NSURL URLWithString:(NSString *)trafficPath];
+            }
             if (btIsTargetWalletURL(url)) {
-                outData = btMaybePatchData(url, data, self_, "onReadResponseData");
+                if ([obj isKindOfClass:[NSData class]]) {
+                    outObj = btMaybePatchData(url, obj, resp, "CJPayBridge");
+                } else if ([obj isKindOfClass:[NSDictionary class]] || [obj isKindOfClass:[NSArray class]]) {
+                    if ([NSJSONSerialization isValidJSONObject:obj]) {
+                        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil];
+                        if (jsonData) {
+                            NSData *patchedData = btMaybePatchData(url, jsonData, resp, "CJPayBridge-Obj");
+                            if (patchedData != jsonData && [patchedData isKindOfClass:[NSData class]]) {
+                                id newObj = [NSJSONSerialization JSONObjectWithData:patchedData options:0 error:nil];
+                                if (newObj) outObj = newObj;
+                            }
+                        }
+                    }
+                } else if ([obj isKindOfClass:[NSString class]]) {
+                    NSData *strData = [(NSString *)obj dataUsingEncoding:NSUTF8StringEncoding];
+                    if (strData) {
+                        NSData *patchedData = btMaybePatchData(url, strData, resp, "CJPayBridge-Str");
+                        if (patchedData != strData && [patchedData isKindOfClass:[NSData class]]) {
+                            NSString *newStr = [[NSString alloc] initWithData:patchedData encoding:NSUTF8StringEncoding];
+                            if (newStr) outObj = newStr;
+                        }
+                    }
+                }
             }
         }
-        fn(self_, sel, outData);
+        fn(self_, sel, resp, outObj, err, trafficPath, comp);
     };
 
     method_setImplementation(m, imp_implementationWithBlock(blk));
-    TTHLOG(@"✓ 已 hook TTHttpTaskChromium -onReadResponseData:");
-}
-
-// ============================================================
-// 只读诊断：打印 TTNetworkManager 相关关键方法签名（绝不 hook）
-// ============================================================
-static void btLogKeySignatures(void) {
-    Class mgr = NSClassFromString(@"TTNetworkManager");
-    if (mgr) {
-        SEL s1 = NSSelectorFromString(@"addResponseMutableDataFilterBlock:");
-        Method m1 = class_getInstanceMethod(mgr, s1);
-        if (m1) {
-            TTHLOG(@"[诊断] TTNetworkManager -addResponseMutableDataFilterBlock: => %s",
-                   method_getTypeEncoding(m1) ?: "?");
-        }
-    }
-    Class chr = NSClassFromString(@"TTNetworkManagerChromium");
-    if (chr) {
-        SEL s2 = NSSelectorFromString(@"requestForBinaryWithResponse:params:method:needCommonParams:callback:");
-        Method m2 = class_getInstanceMethod(chr, s2);
-        if (m2) {
-            TTHLOG(@"[诊断] TTNetworkManagerChromium -requestForBinaryWithResponse:... => %s",
-                   method_getTypeEncoding(m2) ?: "?");
-        }
-    }
+    TTHLOG(@"✓ 已 hook BDXBridgeTtcjpayMultiNetRequestMethod -p_handleResponse:...");
 }
 
 // ============================================================
@@ -321,10 +432,9 @@ static void btLogKeySignatures(void) {
 void BTInstallTTNetProbe(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        TTHLOG(@"========== TTNet 精准 Hook (v5) 启动 ==========");
-        btLogKeySignatures();
+        TTHLOG(@"========== 钱包首页 JSON/TTNet Hook 启动 ==========");
         btHookHandleResponsePreProcessing();
-        btHookOnReadResponseData();
-        TTHLOG(@"========== TTNet 精准 Hook 安装完成 ==========");
+        btHookCJPayBridgeResponse();
+        TTHLOG(@"========== 钱包首页 Hook 安装完成 ==========");
     });
 }

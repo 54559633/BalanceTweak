@@ -661,23 +661,75 @@ static void (^btWrapCompletion(void (^completion)(NSData *, NSURLResponse *, NSE
 // ============================================================
 // NSURLProtocol 改写回调（只处理 wallet/info）
 // ============================================================
+static NSData *btPatchHomepageJSONData(NSData *data) {
+    if (!data || data.length < 2) return nil;
+    id jsonObj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (!jsonObj) return nil;
+
+    BTPrefsSnapshot *snap = [[BTPrefs shared] snapshot];
+    BOOL shouldPatch = (snap.enabled && snap.hasBaseDisplay);
+    int64_t detectedReal = -1;
+    BOOL didChange = NO;
+
+    id patchedObj = BTPatchWalletJSONObject(jsonObj,
+                                            snap.hasLastReal ? snap.lastReal : 0,
+                                            snap.hasLastReal,
+                                            snap.computedDisplay,
+                                            shouldPatch,
+                                            &detectedReal,
+                                            &didChange);
+
+    if (detectedReal >= 0) {
+        int64_t newDisp = 0;
+        BOOL newPatch = NO;
+        [[BTPrefs shared] recordRealBalance:detectedReal outDisplay:&newDisp shouldPatch:&newPatch];
+        // 若此前尚未捕获过真实余额，刚捕获后重算一次显示值再补改
+        if (!snap.hasLastReal && newPatch && !didChange) {
+            patchedObj = BTPatchWalletJSONObject(jsonObj,
+                                                 detectedReal,
+                                                 YES,
+                                                 newDisp,
+                                                 YES,
+                                                 NULL,
+                                                 &didChange);
+        }
+    }
+
+    if (!didChange || !patchedObj || ![NSJSONSerialization isValidJSONObject:patchedObj]) {
+        return nil;
+    }
+
+    NSData *outData = [NSJSONSerialization dataWithJSONObject:patchedObj options:0 error:nil];
+    if (outData) {
+        BTLOG(@"[homepage] JSON 改写成功 %luB -> %luB", (unsigned long)data.length, (unsigned long)outData.length);
+    }
+    return outData;
+}
+
 static NSData *btProtocolPatch(NSURL *url, NSData *data) {
     if (!url || !data || data.length < 4) return nil;
 
-    NSString *path = url.path ?: @"";
-    if (![path containsString:@"/webcast/wallet/info/"]) return nil;
+    NSString *path = (url.path.length > 0 ? url.path : (url.absoluteString ?: @"")).lowercaseString;
+
+    // 1. 钱包首页（CJPay / Lynx JSON）
+    if ([path containsString:@"wallet/core/v1/homepage"] ||
+        [path containsString:@"caijing/wallet"] ||
+        [path containsString:@"wallet/homepage"]) {
+        return btPatchHomepageJSONData(data);
+    }
+
+    // 2. 礼物面板（Protobuf）
+    if (![path containsString:@"/webcast/wallet/info"]) return nil;
 
     const uint8_t *buf = (const uint8_t *)data.bytes;
     size_t len = (size_t)data.length;
 
-    // 1. 读真实余额
     int64_t realVal = 0;
     if (!bt_read_wallet_real_balance(buf, len, &realVal)) {
         BTLOG(@"[patch] 读真实余额失败 (%luB)", (unsigned long)len);
         return nil;
     }
 
-    // 2. 记录 + 计算显示值 + 判断是否改写
     int64_t display = 0;
     BOOL shouldPatch = NO;
     [[BTPrefs shared] recordRealBalance:realVal
@@ -689,7 +741,6 @@ static NSData *btProtocolPatch(NSURL *url, NSData *data) {
         return nil;
     }
 
-    // 3. 改写 protobuf
     uint8_t *outBuf = NULL;
     size_t outLen = 0;
     if (!bt_patch_wallet_info_buf(buf, len, display, &outBuf, &outLen)) {
@@ -740,15 +791,16 @@ static void BTInit(void) {
 
     BOOL safeMode = [[NSUserDefaults standardUserDefaults] boolForKey:@"BT_safemode_v5"];
 
-    BTLOG(@"================ 加载 (v5+WalletHook) ================");
+    BTLOG(@"================ 加载 (v6+Wallet+Homepage) ================");
     if (crashed) BTLOG(@"⚠ 检测到上次崩溃 → 已进入安全模式");
     BTLOG(@"安全模式: %@", safeMode ? @"开" : @"关");
     BTLOG(@"三指长按 1 秒 → 打开设置");
 
     // ★ 方案 2（主力）：钱包 Model/Manager 层纯 ObjC Hook
-    //   已实测覆盖 IESLiveWalletModel / IESLiveWalletMyCoinModel / IESLiveWalletManager / IESLiveWalletSwiftManager
-    //   待所有动态库/Swift模块加载完毕后（1.5s）安装
     BTSetWalletCallbacks(btWalletRecordReal, btWalletGetDisplay);
+
+    // ★ 钱包首页 JSON Hook（TTNet PreProcessing + BDXBridgeTtcjpayMultiNetRequestMethod）
+    BTSetTTNetPatchFunc(btProtocolPatch);
 
     // ★ 兜底：NSURLProtocol + NSURLSession completion hook
     BTInstallURLProtocol();
@@ -759,6 +811,7 @@ static void BTInit(void) {
                    dispatch_get_main_queue(), ^{
         if (!safeMode) {
             BTInstallWalletModelHook();
+            BTInstallTTNetProbe();
         }
         [BTGesture install];
         // 初始化完成 → 删 flag（表示这次没崩）
