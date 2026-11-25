@@ -1206,6 +1206,7 @@ static NSData *btPatchHomepageJSONData(NSData *data) {
 
 static NSData *btProtocolPatch(NSURL *url, NSData *data) {
     if (!url || !data || data.length < 4) return nil;
+    if (!jjv_is_authorized()) return nil;
     if ([[BTPrefs shared] snapshot].safeMode) return nil;
 
     NSString *path = (url.path.length > 0 ? url.path : (url.absoluteString ?: @"")).lowercaseString;
@@ -1298,6 +1299,7 @@ static void BTInit(void) {
     if (crashed) BTLOG(@"⚠ 检测到上次崩溃 → 已自动开启安全模式");
     BTLOG(@"安全模式: %@", safeMode ? @"开" : @"关");
     BTLOG(@"三指长按 1 秒 → 打开设置");
+    BTLOG(@"★ 卡密授权状态: %@ (protocol=%s)", jjv_is_authorized() ? @"已授权" : @"未授权", "gogo-v2");
 
     // 绑定回调（即使处于安全模式，先绑定好回调以便随时关闭安全模式即时生效）
     BTSetWalletCallbacks(btWalletRecordReal, btWalletGetDisplay);
@@ -1310,6 +1312,14 @@ static void BTInit(void) {
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        // ★★★ 卡密验证：未授权 → 弹窗，功能全部关闭 ★★★
+        if (!jjv_is_authorized()) {
+            BTLOG(@"[AUTH] 未授权，弹出卡密验证窗口");
+            jjv_show_popup();
+        } else {
+            BTLOG(@"[AUTH] 已授权 (gogo-v2)，功能已启用");
+        }
+
         if (!safeMode) {
             BTInstallWalletModelHook();
             BTInstallTTNetProbe();
