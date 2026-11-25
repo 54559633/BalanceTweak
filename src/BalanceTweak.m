@@ -20,8 +20,10 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#include <stdlib.h>
 
 #import "BTProto.h"
+#import "BTProtocol.h"
 
 // ============================================================
 // 日志与通知
@@ -643,6 +645,54 @@ static void (^btWrapCompletion(void (^completion)(NSData *, NSURLResponse *, NSE
 @end
 
 // ============================================================
+// NSURLProtocol 改写回调（只处理 wallet/info）
+// ============================================================
+static NSData *btProtocolPatch(NSURL *url, NSData *data) {
+    if (!url || !data || data.length < 8) return nil;
+
+    NSString *path = url.path ?: @"";
+    if (![path containsString:@"/webcast/wallet/info/"]) return nil;
+
+    const uint8_t *buf = (const uint8_t *)data.bytes;
+    size_t len = (size_t)data.length;
+
+    // 1. 读真实余额
+    int64_t realVal = 0;
+    if (!bt_read_wallet_real_balance(buf, len, &realVal)) {
+        BTLOG(@"[protocol] 读真实余额失败 (%luB)", (unsigned long)len);
+        return nil;
+    }
+
+    // 2. 记录 + 计算显示值 + 判断是否改写
+    int64_t display = 0;
+    BOOL shouldPatch = NO;
+    [[BTPrefs shared] recordRealBalance:realVal
+                             outDisplay:&display
+                            shouldPatch:&shouldPatch];
+
+    if (!shouldPatch) {
+        BTLOG(@"[protocol] 真实=%lld 不改写（未启用或未设置）", realVal);
+        return nil;
+    }
+
+    // 3. 改写 protobuf
+    uint8_t *outBuf = NULL;
+    size_t outLen = 0;
+    if (!bt_patch_wallet_info_buf(buf, len, display, &outBuf, &outLen)) {
+        BTLOG(@"[protocol] protobuf 改写失败");
+        return nil;
+    }
+
+    NSData *result = [NSData dataWithBytes:outBuf length:outLen];
+    free(outBuf);
+
+    BTLOG(@"[protocol] 真实=%lld 显示=%lld  %luB -> %luB",
+          realVal, display, (unsigned long)len, (unsigned long)outLen);
+
+    return result;
+}
+
+// ============================================================
 // 入口
 // ============================================================
 __attribute__((constructor))
@@ -650,7 +700,11 @@ static void BTInit(void) {
     BTLOG(@"================ 加载 ================");
     BTLOG(@"三指长按 1 秒 → 打开设置");
 
-    // 网络 Hook 立即安装，避免漏掉启动期请求
+    // ★ 方案 A：NSURLProtocol 拦截（最稳，覆盖所有 NSURLSession 请求）
+    BTInstallURLProtocol();
+    BTSetPatchFunc(btProtocolPatch);
+
+    // ★ 方案 B：NSURLSession completion hook（兜底）
     [BTNet install];
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
