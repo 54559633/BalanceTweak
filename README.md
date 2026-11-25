@@ -20,7 +20,7 @@
 
 ## 编译
 
-GitHub Actions 自动运行单元测试并编译（`macos-14` runner，自带 Xcode + iOS SDK）：
+GitHub Actions 自动运行单元测试并编译（`macos-15` runner，自带 Xcode + iOS SDK）：
 
 ```
 Actions → Build Dylib → 下载 BalanceTweak-dylib
