@@ -143,13 +143,13 @@ char* jjv_device_info_json(void) {
     @autoreleasepool {
         NSMutableDictionary *info = [NSMutableDictionary dictionary];
         info[@"protocol"] = @"gogo-v2";
-        info[@"build"] = ns(jjv_build_id());
+        info[@"build"] = jjcloud::ns(jjv_build_id());
         info[@"authorized"] = @(jjcloud::isAuthorized());
 
         std::string idHex = jjcloud::currentDeviceIdHex();
         if (!idHex.empty()) {
-            info[@"device_id"] = ns(idHex);
-            info[@"device_prefix"] = ns(jjcloud::currentDeviceIdPrefix());
+            info[@"device_id"] = jjcloud::ns(idHex);
+            info[@"device_prefix"] = jjcloud::ns(jjcloud::currentDeviceIdPrefix());
             info[@"device_id_length"] = @(idHex.size());
         } else {
             info[@"device_id"] = @"";
@@ -159,7 +159,7 @@ char* jjv_device_info_json(void) {
         // 合并 startup 诊断（含 device_prefix / version 等）
         @try {
             std::string diagStr = jjcloud::startupDiagnosticsJSON();
-            NSData *dd = [ns(diagStr) dataUsingEncoding:NSUTF8StringEncoding];
+            NSData *dd = [jjcloud::ns(diagStr) dataUsingEncoding:NSUTF8StringEncoding];
             if (dd) {
                 id obj = [NSJSONSerialization JSONObjectWithData:dd options:0 error:nil];
                 if ([obj isKindOfClass:[NSDictionary class]]) {
@@ -173,7 +173,7 @@ char* jjv_device_info_json(void) {
         NSData *out = [NSJSONSerialization dataWithJSONObject:info options:0 error:nil];
         if (!out) return copyCString("{}");
         NSString *s = [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding];
-        return copyCString(cpp(s ?: @"{}"));
+        return copyCString(jjcloud::cpp(s ?: @"{}"));
     }
 }
 

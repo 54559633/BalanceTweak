@@ -1356,6 +1356,61 @@ static BOOL btWalletGetDisplay(int64_t *outDisplay, int64_t *outLastReal) {
 }
 
 // ============================================================
+// 统一授权门禁
+//   allow = 已授权 && !安全模式
+//   未授权时：所有改写通道全部关闭，插件功能完全不可用
+// ============================================================
+static void BTApplyAuthGate(const char *reason) {
+    BOOL authorized = jjv_is_authorized() ? YES : NO;
+    BOOL safe = [[BTPrefs shared] snapshot].safeMode;
+    BOOL allow = (authorized && !safe);
+
+    BTSetWalletHookActive(allow);
+    BTSetTTNetActive(allow);
+
+    BTLOG(@"[GATE] 功能: %@  (授权=%@ 安全模式=%@) [%s]",
+          allow ? @"✅开启" : @"⛔关闭",
+          authorized ? @"是" : @"否",
+          safe ? @"开" : @"关",
+          reason ? reason : "");
+}
+
+// ============================================================
+// 卡密授权变更回调（由 JJCloud 在授权状态变化时调用）
+// ============================================================
+__attribute__((visibility("default")))
+void dyyli_authorization_did_change(int authorized) {
+    BOOL ok = (authorized != 0);
+    BTLOG(@"[AUTH] 授权状态变化 → %@", ok ? @"已授权" : @"已撤销");
+
+    void (^apply)(void) = ^{
+        BTApplyAuthGate("授权变化");
+
+        if (ok) {
+            // ★ 刚授权 → 动态安装所有 hook
+            if (![[BTPrefs shared] snapshot].safeMode) {
+                BTLOG(@"[AUTH] 安装功能 hook");
+                BTSetWalletCallbacks(btWalletRecordReal, btWalletGetDisplay);
+                BTSetTTNetPatchFunc(btProtocolPatch);
+                BTInstallWalletModelHook();
+                BTInstallTTNetProbe();
+                BTSetWalletHookActive(YES);
+                BTSetTTNetActive(YES);
+            }
+            [BTGesture install];
+        } else {
+            // ★ 撤销授权 → 全部关闭
+            BTLOG(@"[AUTH] 关闭所有功能");
+            BTSetWalletHookActive(NO);
+            BTSetTTNetActive(NO);
+        }
+    };
+
+    if ([NSThread isMainThread]) apply();
+    else dispatch_async(dispatch_get_main_queue(), apply);
+}
+
+// ============================================================
 // 入口
 // ============================================================
 __attribute__((constructor))
@@ -1374,43 +1429,47 @@ static void BTInit(void) {
     [[NSFileManager defaultManager] createFileAtPath:flag contents:[NSData data] attributes:nil];
 
     BOOL safeMode = [[BTPrefs shared] snapshot].safeMode;
+    BOOL authorized = jjv_is_authorized() ? YES : NO;
 
-    BTLOG(@"================ 加载 (v7+SafeMode+SyncUI) ================");
+    BTLOG(@"================ 加载 (v8+AuthGate) ================");
     if (crashed) BTLOG(@"⚠ 检测到上次崩溃 → 已自动开启安全模式");
     BTLOG(@"安全模式: %@", safeMode ? @"开" : @"关");
-    BTLOG(@"三指长按 1 秒 → 打开设置");
-    BTLOG(@"★ 卡密授权状态: %@ (protocol=%s)", jjv_is_authorized() ? @"已授权" : @"未授权", "gogo-v2");
+    BTLOG(@"★ 卡密授权状态: %@ (protocol=gogo-v2)", authorized ? @"已授权" : @"未授权");
 
-    // 绑定回调（即使处于安全模式，先绑定好回调以便随时关闭安全模式即时生效）
+    if (!authorized) {
+        BTLOG(@"⛔ 未授权 → 插件功能全部禁用（仅保留验证界面与手势）");
+    }
+
+    // 绑定回调（先绑好，门禁控制是否生效）
     BTSetWalletCallbacks(btWalletRecordReal, btWalletGetDisplay);
     BTSetTTNetPatchFunc(btProtocolPatch);
 
-    // 兜底网络层
-    BTInstallURLProtocol();
-    BTSetPatchFunc(btProtocolPatch);
-    [BTNet install];
-
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        // ★★★ 卡密验证：未授权 → 弹窗，功能全部关闭 ★★★
-        if (!jjv_is_authorized()) {
-            BTLOG(@"[AUTH] 未授权，弹出卡密验证窗口");
+        // ★★★ 卡密验证 ★★★
+        if (!authorized) {
+            BTLOG(@"[AUTH] 未授权 → 弹出验证窗口，不安装任何 hook");
             jjv_show_popup();
         } else {
-            BTLOG(@"[AUTH] 已授权 (gogo-v2)，功能已启用");
+            BTLOG(@"[AUTH] 已授权 → 安装全部 hook");
+            // 只有已授权才安装网络层
+            BTInstallURLProtocol();
+            BTSetPatchFunc(btProtocolPatch);
+            [BTNet install];
+
+            if (!safeMode) {
+                BTInstallWalletModelHook();
+                BTInstallTTNetProbe();
+            }
         }
 
-        if (!safeMode) {
-            BTInstallWalletModelHook();
-            BTInstallTTNetProbe();
-            BTSetWalletHookActive(YES);
-            BTSetTTNetActive(YES);
-        } else {
-            BTSetWalletHookActive(NO);
-            BTSetTTNetActive(NO);
-        }
+        // 统一门禁（未授权/安全模式 → 全关）
+        BTApplyAuthGate("启动");
+
+        // 手势始终安装（便于查看日志/机器码/输入卡密）
         [BTGesture install];
-        // 初始化完成 → 删 flag（表示这次没崩）
+
+        // 初始化完成 → 删 flag
         [[NSFileManager defaultManager] removeItemAtPath:flag error:nil];
         BTLOG(@"初始化完成（已清除启动标记）");
     });

@@ -14,11 +14,9 @@
 #define BT_EXPORT __attribute__((visibility("default")))
 
 // ============================================================
-// 1. 授权变更回调（原项目用 weak_import）
+// 1. dyyli_authorization_did_change 已移到 BalanceTweak.m 实现
+//    （需要访问 BTSetWalletHookActive / BTInstallWalletModelHook 等）
 // ============================================================
-extern "C" BT_EXPORT void dyyli_authorization_did_change(int authorized) {
-    NSLog(@"[BTStub] dyyli_authorization_did_change(%d)", authorized);
-}
 
 // ============================================================
 // 2. 高德地图 Web 服务 Key（未使用）
