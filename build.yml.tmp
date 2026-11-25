@@ -1,0 +1,93 @@
+name: Build Dylib
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show environment
+        run: |
+          echo "=== Xcode ==="
+          xcodebuild -version || true
+          echo "=== SDKs ==="
+          xcodebuild -showsdks || true
+          echo "=== clang ==="
+          xcrun clang --version || true
+
+      - name: Install ldid
+        run: |
+          brew install ldid || brew install --HEAD ldid || true
+          which ldid || echo "ldid not found, will sign with codesign"
+
+      - name: Build arm64
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK = $SDK"
+          xcrun clang -dynamiclib \
+            -target arm64-apple-ios14.0 \
+            -isysroot "$SDK" \
+            -fobjc-arc \
+            -O2 \
+            -framework UIKit \
+            -framework Foundation \
+            -o build-arm64.dylib \
+            src/BalanceTweak.m
+          echo "arm64 built: $(ls -lh build-arm64.dylib)"
+
+      - name: Build arm64e
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun clang -dynamiclib \
+            -target arm64e-apple-ios14.0 \
+            -isysroot "$SDK" \
+            -fobjc-arc \
+            -O2 \
+            -framework UIKit \
+            -framework Foundation \
+            -o build-arm64e.dylib \
+            src/BalanceTweak.m
+          echo "arm64e built: $(ls -lh build-arm64e.dylib)"
+
+      - name: Create fat binary
+        run: |
+          set -e
+          lipo -create build-arm64.dylib build-arm64e.dylib -output BalanceTweak.dylib
+          echo "=== fat binary info ==="
+          lipo -info BalanceTweak.dylib
+          ls -lh BalanceTweak.dylib
+
+      - name: Sign with ldid
+        run: |
+          if command -v ldid >/dev/null 2>&1; then
+            ldid -S BalanceTweak.dylib
+            echo "ldid signed"
+            ldid -e BalanceTweak.dylib | head -20 || true
+          else
+            echo "ldid unavailable, skipping (TrollFools will re-sign on device)"
+          fi
+
+      - name: Verify
+        run: |
+          echo "=== file info ==="
+          file BalanceTweak.dylib
+          echo "=== exports ==="
+          nm -gU BalanceTweak.dylib 2>/dev/null | head -20 || true
+          echo "=== size ==="
+          stat -f "%z bytes" BalanceTweak.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BalanceTweak-dylib
+          path: BalanceTweak.dylib
+          retention-days: 30
