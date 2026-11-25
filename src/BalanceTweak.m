@@ -29,6 +29,7 @@
 #import "BTWalletHook.h"
 #import "BTLogVC.h"
 #import "BTSSLHook.h"
+#include "JJCloudVerifier.h"   // ★ gogo-v2 卡密验证（C ABI）
 
 // ============================================================
 // 日志与通知
