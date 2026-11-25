@@ -18,6 +18,8 @@ $common = @(
     "-isysroot"; $SDK
     "-fobjc-arc"
     "-O2"
+    "-fvisibility=hidden"
+    "-install_name"; "@rpath/BalanceTweak.dylib"
     "-Wl,-undefined,dynamic_lookup"
     "-Wl,-no_fixup_chains"
 )

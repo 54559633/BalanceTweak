@@ -7,8 +7,21 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build & run unit tests
+        run: |
+          gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -O2 \
+            tests/test_bt_proto.c -o test_bt_proto
+          ./test_bt_proto
+
   build:
-    runs-on: macos-13
+    needs: test
+    runs-on: macos-14
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,6 +50,9 @@ jobs:
             -isysroot "$SDK" \
             -fobjc-arc \
             -O2 \
+            -Wall -Wextra \
+            -fvisibility=hidden \
+            -install_name @rpath/BalanceTweak.dylib \
             -framework UIKit \
             -framework Foundation \
             -o build-arm64.dylib \
@@ -52,18 +68,23 @@ jobs:
             -isysroot "$SDK" \
             -fobjc-arc \
             -O2 \
+            -Wall -Wextra \
+            -fvisibility=hidden \
+            -install_name @rpath/BalanceTweak.dylib \
             -framework UIKit \
             -framework Foundation \
             -o build-arm64e.dylib \
             src/BalanceTweak.m
           echo "arm64e built: $(ls -lh build-arm64e.dylib)"
 
-      - name: Create fat binary
+      - name: Create fat binary & strip
         run: |
           set -e
           lipo -create build-arm64.dylib build-arm64e.dylib -output BalanceTweak.dylib
+          strip -x BalanceTweak.dylib
           echo "=== fat binary info ==="
           lipo -info BalanceTweak.dylib
+          otool -D BalanceTweak.dylib
           ls -lh BalanceTweak.dylib
 
       - name: Sign with ldid

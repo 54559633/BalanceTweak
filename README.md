@@ -13,14 +13,14 @@
   - 送礼（真实减少）→ 显示同步减少
   - 收礼（真实增加）→ 显示同步增加
 - 配置持久化（NSUserDefaults）
-- 覆盖三个余额显示位置：
-  - 礼物面板（`/webcast/wallet/info/`）
-  - 钱包首页（`/caijing/wallet/core/v1/homepage/index/`）
-  - 充值页（`/webcast/wallet_api/recharge_page/`）
+- 余额接口覆盖：
+  - 礼物面板（`/webcast/wallet/info/`，已实现）
+  - 钱包首页（`/caijing/wallet/core/v1/homepage/index/`，待扩展）
+  - 充值页（`/webcast/wallet_api/recharge_page/`，待扩展）
 
 ## 编译
 
-GitHub Actions 自动编译（`macos-14` runner，自带 Xcode + iOS SDK）：
+GitHub Actions 自动运行单元测试并编译（`macos-14` runner，自带 Xcode + iOS SDK）：
 
 ```
 Actions → Build Dylib → 下载 BalanceTweak-dylib
@@ -33,19 +33,31 @@ SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 
 # arm64
 xcrun clang -dynamiclib -target arm64-apple-ios14.0 \
-  -isysroot "$SDK" -fobjc-arc -framework UIKit -framework Foundation \
+  -isysroot "$SDK" -fobjc-arc -O2 -fvisibility=hidden \
+  -install_name @rpath/BalanceTweak.dylib \
+  -framework UIKit -framework Foundation \
   -o build-arm64.dylib src/BalanceTweak.m
 
 # arm64e
 xcrun clang -dynamiclib -target arm64e-apple-ios14.0 \
-  -isysroot "$SDK" -fobjc-arc -framework UIKit -framework Foundation \
+  -isysroot "$SDK" -fobjc-arc -O2 -fvisibility=hidden \
+  -install_name @rpath/BalanceTweak.dylib \
+  -framework UIKit -framework Foundation \
   -o build-arm64e.dylib src/BalanceTweak.m
 
-# 合并
+# 合并 & 去符号
 lipo -create build-arm64.dylib build-arm64e.dylib -output BalanceTweak.dylib
+strip -x BalanceTweak.dylib
 
 # 签名
 ldid -S BalanceTweak.dylib
+```
+
+运行单元测试（Linux / macOS）：
+
+```bash
+gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -O2 \
+  tests/test_bt_proto.c -o test_bt_proto && ./test_bt_proto
 ```
 
 ## 注入
@@ -177,8 +189,12 @@ hook `NSURLSession` 的 `dataTaskWithRequest:completionHandler:`，
 
 ```
 BalanceTweak/
-├─ .github/workflows/build.yml   GitHub Actions 编译配置
-├─ src/BalanceTweak.m            源码（单文件）
+├─ .github/workflows/build.yml   GitHub Actions 测试与编译配置
+├─ src/BTProto.h                 Protobuf 解析/改写与余额计算核心（纯 C）
+├─ src/BalanceTweak.m            iOS Hook / 配置管理 / 设置界面
+├─ tests/test_bt_proto.c         核心逻辑单元测试
+├─ build.ps1                     Windows 本地交叉编译脚本
+├─ make_fat.py                   Fat binary 合并脚本
 └─ README.md
 ```
 
