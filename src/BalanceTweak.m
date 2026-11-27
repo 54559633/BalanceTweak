@@ -1,4 +1,4 @@
-//
+﻿//
 // BalanceTweak.m —— 抖音钻石余额自定义显示
 // ============================================================
 // 功能：
@@ -29,6 +29,7 @@
 #import "BTWalletHook.h"
 #import "BTLogVC.h"
 #import "BTSSLHook.h"
+#import "BTUpdateBlocker.h"   // ★ 屏蔽抖音版本检查（强制启用，不可关闭）
 #include "JJCloudVerifier.h"   // ★ gogo-v2 卡密验证（C ABI）
 
 // ============================================================
@@ -1442,7 +1443,7 @@ static void BTInit(void) {
     BOOL safeMode = [[BTPrefs shared] snapshot].safeMode;
     BOOL authorized = jjv_is_authorized() ? YES : NO;
 
-    BTLOG(@"================ 加载 (v8+AuthGate) ================");
+    BTLOG(@"================ 加载 (v9+AuthGate+UpdateBlock) ================");
     if (crashed) BTLOG(@"⚠ 检测到上次崩溃 → 已自动开启安全模式");
     BTLOG(@"安全模式: %@", safeMode ? @"开" : @"关");
     BTLOG(@"★ 卡密授权状态: %@ (protocol=gogo-v2)", authorized ? @"已授权" : @"未授权");
@@ -1454,6 +1455,10 @@ static void BTInit(void) {
     // 绑定回调（先绑好，门禁控制是否生效）
     BTSetWalletCallbacks(btWalletRecordReal, btWalletGetDisplay);
     BTSetTTNetPatchFunc(btProtocolPatch);
+
+    // ★ 版本检查屏蔽：强制启用，不经过授权门禁，也没有关闭入口。
+    //   放在这里而不是 dispatch_after 里，是为了赶在抖音首次发起版本检查之前。
+    BTInstallUpdateBlocking();
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
