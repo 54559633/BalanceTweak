@@ -1,12 +1,13 @@
-﻿//
+//
 // BTUpdateBlocker.m —— 屏蔽抖音应用内版本检查与更新弹窗
 // ============================================================
 // 机理（均来自对目标 dylib「屏蔽抖音检测更新 1.0.2」的实测，非推测）：
 //
-//   1. AWEVersionUpdateAlert -canShow          → 恒定 NO，弹窗不呈现
+//   1. AWEVersionUpdateAlert -canShow           → 恒定 NO，弹窗不呈现
 //   2. AWENewVersionAlertManager 的 5 个检查方法 → 空实现，请求不发起
-//   3. 抖音部分类晚于本 dylib 注册，ctor 阶段 NSClassFromString 会返回 nil，
-//      因此挂 dyld_register_func_for_add_image 回调补装。
+//   3. 晚注册兜底：原实现用 dyld_register_func_for_add_image，但该符号
+//      在 iOS SDK 的 libSystem 导出表中缺失，链接期会报 undefined。
+//      此处改用有限次定时重试，效果等价且不引入链接依赖。
 //
 // 设计要点：
 //   · 挂钩前先校验返回类型编码，不匹配就不挂 —— 把 void 当 BOOL 挂钩，
@@ -21,14 +22,8 @@
 #import "BTUpdateBlocker.h"
 #import "BTLog.h"
 
-#import <mach-o/dyld.h>
 #import <objc/runtime.h>
 #import <string.h>
-
-// 部分 iOS SDK 的 <mach-o/dyld.h> 未暴露该原型（实测 iOS 16.5 SDK 编译期报
-// implicit-function-declaration）。此处显式声明，与头文件原型一致，重复声明合法。
-extern void dyld_register_func_for_add_image(void (*func)(const struct mach_header *mh,
-                                                                 intptr_t vmaddr_slide));
 
 #define BTUPLOG(fmt, ...) BT_LOG_M(@"UpdBlk", fmt, ##__VA_ARGS__)
 
@@ -135,28 +130,39 @@ static BOOL gBTUPManagerDone = NO;
 static BOOL gBTUPLogged = NO;
 static NSInteger gBTUPDoneCount = 0;
 
-// 抖音类可能在任意时刻注册，因此这里不加锁：
-// 两条路径（ctor / dyld 回调）都在主线程或 dyld 加载回调中执行，
-// 且每个目标只从 NO 变 YES 一次，重复写入同一值是幂等的。
+// 每个目标只从 NO 变 YES 一次，重复写入同一值是幂等的，
+// 因此这里不引入锁；调用点都在主队列上。
 static void BTUPInstallIfPossible(void) {
     if (!gBTUPAlertDone) gBTUPAlertDone = BTUPInstallAlertBlocking();
     if (!gBTUPManagerDone) gBTUPManagerDone = BTUPInstallManagerBlocking();
 
-    NSInteger done = (gBTUPAlertDone ? 1 : 0) + (gBTUPManagerDone ? 1 : 0);
-    gBTUPDoneCount = done;
+    gBTUPDoneCount = (gBTUPAlertDone ? 1 : 0) + (gBTUPManagerDone ? 1 : 0);
 
-    if (done == 2 && !gBTUPLogged) {
+    if (gBTUPDoneCount == 2 && !gBTUPLogged) {
         gBTUPLogged = YES;
         BTUPLOG(@"✅ 版本检查屏蔽已生效（弹窗 + 检查入口 全部就位）");
     }
 }
 
-static void BTUPImageAdded(const struct mach_header *header, intptr_t slide) {
-    (void)header;
-    (void)slide;
+// 晚注册兜底：抖音部分类可能在 ctor 之后才注册。
+// 用有限次递增间隔重试替代 dyld 回调 —— 后者依赖的
+// dyld_register_func_for_add_image 在 iOS SDK 中链接不到。
+// 4 次重试覆盖启动后 6 秒内的类注册，装齐后每次都是空转。
+static void BTUPScheduleRetries(void) {
+    static const int64_t delaysMs[] = {500, 1500, 3000, 6000};
+    static BOOL scheduled = NO;
+    if (scheduled) return;
+    scheduled = YES;
 
-    if (gBTUPAlertDone && gBTUPManagerDone) return;   // 已装齐，直接返回
-    BTUPInstallIfPossible();
+    const size_t count = sizeof(delaysMs) / sizeof(delaysMs[0]);
+    for (size_t i = 0; i < count; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)delaysMs[i] * (int64_t)NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            if (gBTUPAlertDone && gBTUPManagerDone) return;
+            BTUPInstallIfPossible();
+        });
+    }
 }
 
 #pragma mark - 对外接口
@@ -169,13 +175,14 @@ void BTInstallUpdateBlocking(void) {
     @autoreleasepool {
         // 强制启用：不读任何偏好键，也没有关闭分支。
         // 与卡密授权门禁完全独立 —— 未授权时其它功能关闭，本项照常工作。
+        //
+        // ctor 阶段主可执行文件的 ObjC 类已完成注册（_objc_init 早于
+        // 各镜像的初始化函数），所以这里通常一次就能装齐。
         BTUPInstallIfPossible();
 
-        // 抖音存在多个版本检查入口，且部分类晚于 ctor 注册。
-        // 回调在装齐后是空转，代价可忽略。
-        dyld_register_func_for_add_image(&BTUPImageAdded);
+        BTUPScheduleRetries();
 
-        BTUPLOG(@"版本检查屏蔽已安装（第 1 轮）；当前就位 %ld/2",
+        BTUPLOG(@"版本检查屏蔽已安装（首轮）；当前就位 %ld/2",
                 (long)gBTUPDoneCount);
     }
 }
