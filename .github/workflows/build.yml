@@ -49,7 +49,7 @@ jobs:
           echo "=== 1. Objective-C (.m) ==="
           xcrun clang -c -target arm64-apple-ios14.0 -isysroot "$SDK" \
             -fobjc-arc -O2 -fvisibility=hidden -I src/auth \
-            src/BalanceTweak.m src/BTProtocol.m src/BTTTNetProbe.m src/BTWalletHook.m src/BTLog.m src/BTLogVC.m
+            src/BalanceTweak.m src/BTProtocol.m src/BTTTNetProbe.m src/BTWalletHook.m src/BTLog.m src/BTLogVC.m src/BTUpdateBlocker.m
 
           echo "=== 2. Objective-C++ / C++ (.mm/.cpp) ==="
           xcrun clang++ -c -target arm64-apple-ios14.0 -isysroot "$SDK" \
@@ -66,7 +66,7 @@ jobs:
             -framework Network \
             -framework CoreGraphics \
             -o build-arm64.dylib \
-            BalanceTweak.o BTProtocol.o BTTTNetProbe.o BTWalletHook.o BTLog.o BTLogVC.o JJCloudCore.o JJCloudApple.o JJCloudAuthUI.o JJCloudVerifier.o BTLocationStubs.o
+            BalanceTweak.o BTProtocol.o BTTTNetProbe.o BTWalletHook.o BTLog.o BTLogVC.o BTUpdateBlocker.o JJCloudCore.o JJCloudApple.o JJCloudAuthUI.o JJCloudVerifier.o BTLocationStubs.o
           echo "arm64 built: $(ls -lh build-arm64.dylib)"
       - name: Build arm64e
         run: |
@@ -77,7 +77,7 @@ jobs:
           echo "=== 1. Objective-C (.m) ==="
           xcrun clang -c -target arm64e-apple-ios14.0 -isysroot "$SDK" \
             -fobjc-arc -O2 -fvisibility=hidden -I src/auth \
-            src/BalanceTweak.m src/BTProtocol.m src/BTTTNetProbe.m src/BTWalletHook.m src/BTLog.m src/BTLogVC.m
+            src/BalanceTweak.m src/BTProtocol.m src/BTTTNetProbe.m src/BTWalletHook.m src/BTLog.m src/BTLogVC.m src/BTUpdateBlocker.m
 
           echo "=== 2. Objective-C++ / C++ (.mm/.cpp) ==="
           xcrun clang++ -c -target arm64e-apple-ios14.0 -isysroot "$SDK" \
@@ -94,7 +94,7 @@ jobs:
             -framework Network \
             -framework CoreGraphics \
             -o build-arm64e.dylib \
-            BalanceTweak.o BTProtocol.o BTTTNetProbe.o BTWalletHook.o BTLog.o BTLogVC.o JJCloudCore.o JJCloudApple.o JJCloudAuthUI.o JJCloudVerifier.o BTLocationStubs.o
+            BalanceTweak.o BTProtocol.o BTTTNetProbe.o BTWalletHook.o BTLog.o BTLogVC.o BTUpdateBlocker.o JJCloudCore.o JJCloudApple.o JJCloudAuthUI.o JJCloudVerifier.o BTLocationStubs.o
           echo "arm64e built: $(ls -lh build-arm64e.dylib)"
       - name: Create fat binary & strip
         run: |

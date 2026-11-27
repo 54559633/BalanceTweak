@@ -50,7 +50,7 @@ jobs:
             -Wl,-undefined,dynamic_lookup \
             -Wl,-no_fixup_chains \
             -o arm64e.dylib \
-            src/BalanceTweak.m src/BTProtocol.m src/BTTTNetProbe.m src/BTWalletHook.m src/BTLog.m src/BTLogVC.m 2>&1 | tee build-arm64e.log
+            src/BalanceTweak.m src/BTProtocol.m src/BTTTNetProbe.m src/BTWalletHook.m src/BTLog.m src/BTLogVC.m src/BTUpdateBlocker.m 2>&1 | tee build-arm64e.log
           ls -lh arm64e.dylib || (echo "=== FAILED ===" && tail -40 build-arm64e.log && exit 1)
 
       - name: Build arm64
@@ -64,7 +64,7 @@ jobs:
             -Wl,-undefined,dynamic_lookup \
             -Wl,-no_fixup_chains \
             -o arm64.dylib \
-            src/BalanceTweak.m src/BTProtocol.m src/BTTTNetProbe.m src/BTWalletHook.m src/BTLog.m src/BTLogVC.m 2>&1 | tee build-arm64.log
+            src/BalanceTweak.m src/BTProtocol.m src/BTTTNetProbe.m src/BTWalletHook.m src/BTLog.m src/BTLogVC.m src/BTUpdateBlocker.m 2>&1 | tee build-arm64.log
           ls -lh arm64.dylib || (echo "=== FAILED ===" && tail -40 build-arm64.log && exit 1)
 
       - name: Merge fat binary

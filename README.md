@@ -13,6 +13,14 @@
   - 送礼（真实减少）→ 显示同步减少
   - 收礼（真实增加）→ 显示同步增加
 - 配置持久化（NSUserDefaults）
+- **屏蔽抖音应用内版本检查**（强制启用，不可关闭）
+  - `AWEVersionUpdateAlert -canShow` → 恒 NO，更新弹窗不呈现
+  - `AWENewVersionAlertManager` 的 5 个检查入口全部空实现：
+    `checkAppNewVersion` / `checkAppNewVersionInhouse` /
+    `checkAppNewVersionTestFlight` / `checkInhouseNewVersionWithDelay` /
+    `checkAppNewVersionInhouseWithDelay`
+  - 独立于卡密授权门禁：未授权时其它功能关闭，本项照常工作
+  - 注：只挡抖音自己发起的检查；App Store 的自动更新是系统层行为，需在系统设置关闭
 - 余额接口覆盖：
   - 礼物面板（`/webcast/wallet/info/`，已实现）
   - 钱包首页（`/caijing/wallet/core/v1/homepage/index/`，待扩展）
