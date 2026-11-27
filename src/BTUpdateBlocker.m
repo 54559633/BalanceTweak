@@ -1,4 +1,4 @@
-//
+﻿//
 // BTUpdateBlocker.m —— 屏蔽抖音应用内版本检查与更新弹窗
 // ============================================================
 // 机理（均来自对目标 dylib「屏蔽抖音检测更新 1.0.2」的实测，非推测）：
@@ -24,6 +24,11 @@
 #import <mach-o/dyld.h>
 #import <objc/runtime.h>
 #import <string.h>
+
+// 部分 iOS SDK 的 <mach-o/dyld.h> 未暴露该原型（实测 iOS 16.5 SDK 编译期报
+// implicit-function-declaration）。此处显式声明，与头文件原型一致，重复声明合法。
+extern void dyld_register_func_for_add_image(void (*func)(const struct mach_header *mh,
+                                                                 intptr_t vmaddr_slide));
 
 #define BTUPLOG(fmt, ...) BT_LOG_M(@"UpdBlk", fmt, ##__VA_ARGS__)
 
@@ -105,7 +110,7 @@ static NSArray<NSString *> *BTUPVersionCheckSelectors(void) {
 static BOOL BTUPInstallAlertBlocking(void) {
     Class cls = NSClassFromString(@"AWEVersionUpdateAlert");
     if (!cls) return NO;
-    return BTUPhookInstanceMethod(cls, @selector(canShow), 'B', (IMP)&BTUPCanShowNo);
+    return BTUPHookInstanceMethod(cls, @selector(canShow), 'B', (IMP)&BTUPCanShowNo);
 }
 
 static BOOL BTUPInstallManagerBlocking(void) {
@@ -116,7 +121,7 @@ static BOOL BTUPInstallManagerBlocking(void) {
     for (NSString *name in BTUPVersionCheckSelectors()) {
         SEL sel = NSSelectorFromString(name);
         if (!sel) continue;
-        if (BTUPhookInstanceMethod(cls, sel, 'v', (IMP)&BTUPVersionCheckNoop)) {
+        if (BTUPHookInstanceMethod(cls, sel, 'v', (IMP)&BTUPVersionCheckNoop)) {
             any = YES;
         }
     }
